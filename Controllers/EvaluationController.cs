@@ -1,14 +1,13 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using MarkSubsystem.Data;
+using MarkSubsystem.DTO;
 using MarkSubsystem.Models;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using MarkSubsystem.DTO;
-using System.Net.Http.Json;
 
 namespace MarkSubsystem.Controllers;
 
@@ -26,20 +25,6 @@ public class EvaluationController : ControllerBase
     {
         _usersDbContext = usersDbContext;
         _httpClient = httpClient;
-    }
-
-    [HttpGet("check-users-db")]
-    public async Task<IActionResult> CheckUsersDb()
-    {
-        try
-        {
-            int userCount = await _usersDbContext.Users.CountAsync();
-            return Ok(new { Message = "Successfully connected to Users database", UserCount = userCount });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, new { Message = "Failed to connect to Users database", Error = ex.Message });
-        }
     }
 
     [HttpPost("upload")]
@@ -96,7 +81,7 @@ public class EvaluationController : ControllerBase
                     return BadRequest($"Test not found: testId={testData.TestId}");
                 }
 
-                var test = await testResponse.Content.ReadFromJsonAsync<TestDto>();
+                var test = await testResponse.Content.ReadFromJsonAsync<Test>();
                 var algoId = test.AlgoId;
 
                 // Получение всех отслеживаемых переменных для algo_id
@@ -107,7 +92,7 @@ public class EvaluationController : ControllerBase
                     return StatusCode((int)variablesResponse.StatusCode, "Error fetching variables.");
                 }
 
-                var trackedVariables = await variablesResponse.Content.ReadFromJsonAsync<List<TrackedVariableDto>>();
+                var trackedVariables = await variablesResponse.Content.ReadFromJsonAsync<List<TrackVariable>>();
 
                 // Формирование текстового файла
                 var userDataContent = new StringBuilder();
@@ -166,10 +151,13 @@ public class EvaluationController : ControllerBase
 
                     var substituteResponse = JsonSerializer.Deserialize<SubstituteValuesResponse>(responseContent);
 
+                    // Сохраняем решения в таблицы
+                    await SaveSolutions(request.SessionId, request.UserId, testData.TestId, testData.Variables, substituteResponse, trackedVariables);
+
                     // Сохраняем шаги из Values
                     var valueSteps = substituteResponse?.Values?.Select(v => v.Step).Distinct().ToList() ?? new List<int>();
                     programStepsByTestId[testData.TestId] = valueSteps;
-                    await LogSuccess($"Program steps from Values for testId={testData.TestId}: {string.Join(",", valueSteps)}");
+                    await LogSuccess($"Program steps from values: {string.Join(",", valueSteps)}");
 
                     // Проверка зацикливания программы
                     if (substituteResponse?.CodeModel != null && !substituteResponse.CodeModel.IsSuccessful)
@@ -339,6 +327,253 @@ public class EvaluationController : ControllerBase
         }
     }
 
+    private async Task SaveSolutions(
+        int sessionId,
+        int userId,
+        int testId,
+        List<VariableDataDto> userVariables,
+        SubstituteValuesResponse substituteResponse,
+        List<TrackVariable> trackedVariables)
+    {
+        // Удаляем старые данные
+        await _usersDbContext.SolutionsByUsers
+            .Where(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId)
+            .ExecuteDeleteAsync();
+
+        await _usersDbContext.VariablesSolutionsByUsers
+            .Where(v => v.TestId == testId && userVariables.Select(u => u.Sequence).Distinct().Contains(v.UserStep))
+            .ExecuteDeleteAsync();
+
+        await _usersDbContext.SolutionsByPrograms
+            .Where(s => s.SessionId == sessionId && s.TestId == testId)
+            .ExecuteDeleteAsync();
+
+        await _usersDbContext.VariablesSolutionsByPrograms
+            .Where(v => v.TestId == testId && substituteResponse.Values.Select(p => p.Step).Distinct().Contains(v.ProgramStep))
+            .ExecuteDeleteAsync();
+
+        // Сохраняем решения пользователя
+        var userSolutions = new List<SolutionsByUser>();
+        var userVariablesSolutions = new List<VariablesSolutionsByUsers>();
+
+        // Группируем переменные по Sequence для уникальных записей SolutionsByUser
+        var userSteps = userVariables
+            .GroupBy(v => new { v.Sequence, v.Step })
+            .Select(g => new { g.Key.Sequence, g.Key.Step, Variables = g.ToList() });
+
+        foreach (var step in userSteps)
+        {
+            var trackedVariable = trackedVariables.FirstOrDefault(v => v.Step == step.Step);
+            if (trackedVariable == null)
+            {
+                await LogError($"Tracked variable not found for step={step.Step}");
+                continue;
+            }
+
+            // Добавляем уникальную запись в SolutionsByUser
+            userSolutions.Add(new SolutionsByUser
+            {
+                SessionId = sessionId,
+                UserId = userId,
+                UserStep = step.Sequence,
+                UserLineNumber = trackedVariable.LineNumber,
+                OrderNumber = step.Sequence,
+                TestId = testId,
+                StepDifficult = 0.5f
+            });
+
+            // Добавляем все переменные для этого шага в VariablesSolutionsByUsers
+            foreach (var variable in step.Variables)
+            {
+                userVariablesSolutions.Add(new VariablesSolutionsByUsers
+                {
+                    UserStep = variable.Sequence,
+                    UserLineNumber = trackedVariable.LineNumber,
+                    OrderNumber = variable.Sequence,
+                    TestId = testId,
+                    VarName = variable.VariableName,
+                    VarValue = variable.VariableValue
+                });
+            }
+        }
+
+        // Сохраняем решения программы
+        var programSolutions = new List<SolutionsByProgram>();
+        var programVariablesSolutions = new List<VariablesSolutionsByProgram>();
+
+        // Группируем значения программы по Step
+        var programSteps = substituteResponse.Values
+            .GroupBy(v => v.Step)
+            .Select(g => new { Step = g.Key, Values = g.ToList() });
+
+        foreach (var step in programSteps)
+        {
+            var trackedVariable = trackedVariables.FirstOrDefault(v => v.Step == step.Step);
+            if (trackedVariable == null)
+            {
+                await LogError($"Tracked variable not found for program step={step.Step}");
+                continue;
+            }
+
+            // Добавляем уникальную запись в SolutionsByProgram
+            programSolutions.Add(new SolutionsByProgram
+            {
+                SessionId = sessionId,
+                TestId = testId,
+                ProgramStep = step.Step,
+                ProgramLineNumber = trackedVariable.LineNumber,
+                OrderNumber = step.Step,
+                StepDifficult = 0.5f
+            });
+
+            // Добавляем все переменные для этого шага в VariablesSolutionsByProgram
+            foreach (var value in step.Values)
+            {
+                programVariablesSolutions.Add(new VariablesSolutionsByProgram
+                {
+                    ProgramStep = value.Step,
+                    ProgramLineNumber = trackedVariable.LineNumber,
+                    OrderNumber = value.Step,
+                    TestId = testId,
+                    VarName = value.VariableName,
+                    VarValue = value.Value
+                });
+            }
+        }
+
+        // Сохраняем данные
+        _usersDbContext.SolutionsByUsers.AddRange(userSolutions);
+        _usersDbContext.VariablesSolutionsByUsers.AddRange(userVariablesSolutions);
+        _usersDbContext.SolutionsByPrograms.AddRange(programSolutions);
+        _usersDbContext.VariablesSolutionsByPrograms.AddRange(programVariablesSolutions);
+
+        await _usersDbContext.SaveChangesAsync();
+        await LogSuccess($"Solutions saved for sessionId={sessionId}, userId={userId}, testId={testId}");
+    }
+
+    [HttpGet("stats")]
+    public async Task<IActionResult> Stats(int sessionId, int userId, int testId)
+    {
+        try
+        {
+            // Проверка существования сессии, пользователя и теста
+            var sessionExists = await _usersDbContext.Sessions.AnyAsync(s => s.SessionId == sessionId);
+            if (!sessionExists)
+            {
+                await LogError($"Session not found: sessionId={sessionId}");
+                return BadRequest("Session not found.");
+            }
+
+            var userExists = await _usersDbContext.Users.AnyAsync(u => u.UserId == userId);
+            if (!userExists)
+            {
+                await LogError($"User not found: userId={userId}");
+                return BadRequest("User not found.");
+            }
+
+            var testExists = await _usersDbContext.SessionTests.AnyAsync(st => st.SessionId == sessionId && st.TestId == testId);
+            if (!testExists)
+            {
+                await LogError($"Test not found: testId={testId} for sessionId={sessionId}");
+                return BadRequest("Test not found for this session.");
+            }
+
+            // Получение данных пользователя
+            var userSteps = await _usersDbContext.SolutionsByUsers
+                .Where(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId)
+                .Select(s => new
+                {
+                    s.UserStep,
+                    s.UserLineNumber,
+                    s.OrderNumber,
+                    s.StepDifficult
+                })
+                .ToListAsync();
+
+            var userVariables = await _usersDbContext.VariablesSolutionsByUsers
+                .Where(v => v.TestId == testId && userSteps.Select(s => s.UserStep).Contains(v.UserStep))
+                .Select(v => new
+                {
+                    v.UserStep,
+                    v.VarName,
+                    v.VarValue
+                })
+                .ToListAsync();
+
+            // Формирование UserSolutionDto
+            var userStepDtos = userSteps
+                .GroupBy(s => s.UserStep)
+                .Select(g => new UserStepDto
+                {
+                    Step = g.Key,
+                    LineNumber = g.First().UserLineNumber,
+                    OrderNumber = g.First().OrderNumber,
+                    StepDifficult = g.First().StepDifficult,
+                    Variables = userVariables
+                        .Where(v => v.UserStep == g.Key)
+                        .Select(v => new VariableDto { VarName = v.VarName, VarValue = v.VarValue })
+                        .ToList()
+                })
+                .ToList();
+
+            var userSolution = new UserSolutionDto { Steps = userStepDtos };
+
+            // Получение данных программы
+            var programSteps = await _usersDbContext.SolutionsByPrograms
+                .Where(s => s.SessionId == sessionId && s.TestId == testId)
+                .Select(s => new
+                {
+                    s.ProgramStep,
+                    s.ProgramLineNumber,
+                    s.OrderNumber,
+                    s.StepDifficult
+                })
+                .ToListAsync();
+
+            var programVariables = await _usersDbContext.VariablesSolutionsByPrograms
+                .Where(v => v.TestId == testId && programSteps.Select(s => s.ProgramStep).Contains(v.ProgramStep))
+                .Select(v => new
+                {
+                    v.ProgramStep,
+                    v.VarName,
+                    v.VarValue
+                })
+                .ToListAsync();
+
+            // Формирование ProgramSolutionDto
+            var programStepDtos = programSteps
+                .GroupBy(s => s.ProgramStep)
+                .Select(g => new ProgramStepDto
+                {
+                    Step = g.Key,
+                    LineNumber = g.First().ProgramLineNumber,
+                    OrderNumber = g.First().OrderNumber,
+                    StepDifficult = g.First().StepDifficult,
+                    Variables = programVariables
+                        .Where(v => v.ProgramStep == g.Key)
+                        .Select(v => new VariableDto { VarName = v.VarName, VarValue = v.VarValue })
+                        .ToList()
+                })
+                .ToList();
+
+            var programSolution = new ProgramSolutionDto { Steps = programStepDtos };
+
+            // Формирование ответа
+            var response = new StatsResponseDto
+            {
+                UserSolution = userSolution,
+                ProgramSolution = programSolution
+            };
+
+            await LogSuccess($"Stats retrieved for sessionId={sessionId}, userId={userId}, testId={testId}");
+            return Ok(response);
+        }
+        catch (Exception ex)
+        {
+            await LogError($"Exception in Stats: {ex.Message}");
+            return StatusCode(500, $"Internal server error: {ex.Message}");
+        }
+    }
 
     private string FormatVariableValue(string varType, string value)
     {
@@ -355,22 +590,11 @@ public class EvaluationController : ControllerBase
 
     private async Task LogError(string message)
     {
-        await System.IO.File.AppendAllTextAsync(_debugLogPath, $"[{DateTime.Now}][Upload] Error: {message}\n");
+        await System.IO.File.AppendAllTextAsync(_debugLogPath, $"[{DateTime.Now}][EvaluationController] Error: {message}\n");
     }
 
     private async Task LogSuccess(string message)
     {
-        await System.IO.File.AppendAllTextAsync(_debugLogPath, $"[{DateTime.Now}][Upload] Success: {message}\n");
+        await System.IO.File.AppendAllTextAsync(_debugLogPath, $"[{DateTime.Now}][EvaluationController] Success: {message}\n");
     }
-}
-
-// DTO для API-запросов
-public record TestDto(int TestId, int AlgoId);
-public record TrackedVariableDto(int Sequence, int LineNumber, string VarName, string VarType, int Step);
-public record IncompleteSolutionResponseDto
-{
-    public string Message { get; init; }
-    public List<MismatchResponseDto>? Mismatches { get; init; }
-    public List<int>? ExtraSteps { get; init; }
-    public List<int>? MissingSteps { get; init; }
 }
