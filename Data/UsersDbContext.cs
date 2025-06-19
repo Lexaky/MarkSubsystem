@@ -21,6 +21,7 @@ public class UsersDbContext : DbContext
     public DbSet<VariablesSolutionsByUsers> VariablesSolutionsByUsers { get; set; }
     public DbSet<SolutionsByProgram> SolutionsByPrograms { get; set; }
     public DbSet<VariablesSolutionsByProgram> VariablesSolutionsByPrograms { get; set; }
+    public DbSet<UserTestAbility> UserTestAbilities { get; set; }
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         // === Groups ===
@@ -213,6 +214,10 @@ public class UsersDbContext : DbContext
         // Настройка VariablesSolutionsByProgram
         modelBuilder.Entity<VariablesSolutionsByProgram>()
             .HasKey(v => new { v.ProgramStep, v.ProgramLineNumber, v.OrderNumber, v.TestId, v.VarName });
+
+        // Настройка таблицы со способностями обучающихся
+        modelBuilder.Entity<UserTestAbility>()
+        .HasKey(uta => new { uta.UserId, uta.TestId });
     }
 }
 
