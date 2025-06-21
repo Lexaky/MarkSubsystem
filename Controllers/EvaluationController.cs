@@ -223,17 +223,110 @@ public class EvaluationController : ControllerBase
                 }
                 await LogDebug($"Substitute-values response: {JsonSerializer.Serialize(substituteResult)}");
 
+                // Fetch true program values by sending "-" to substitute-values
+                using var trueContent = new MultipartFormDataContent();
+                var trueFileStream = new MemoryStream(Encoding.UTF8.GetBytes("-"));
+                trueContent.Add(new StreamContent(trueFileStream), "userDataFile", "input.txt");
+
+                await LogDebug($"Sending POST to {_codeServiceUrl}/substitute-values/{testData.AlgoId}/{testId} for true program values");
+                var trueSubstituteResponse = await _httpClient.PostAsync($"{_codeServiceUrl}/substitute-values/{testData.AlgoId}/{testId}", trueContent);
+                if (!trueSubstituteResponse.IsSuccessStatusCode)
+                {
+                    var errorContent = await trueSubstituteResponse.Content.ReadAsStringAsync();
+                    var errorMessage = $"Failed to fetch true program values for testId={testId}: status={trueSubstituteResponse.StatusCode}, response={errorContent}";
+                    await LogError(errorMessage);
+                    if (request.Type == 0)
+                    {
+                        response.Errors.Add(new ErrorDto { TestId = testId, Message = errorMessage });
+                    }
+                    continue;
+                }
+
+                var trueSubstituteResult = await trueSubstituteResponse.Content.ReadFromJsonAsync<SubstituteValuesResponseDto>();
+                if (trueSubstituteResult == null || !trueSubstituteResult.CodeModel.IsSuccessful)
+                {
+                    var errorMessage = $"True substitute-values failed for testId={testId}: IsSuccessful={trueSubstituteResult?.CodeModel.IsSuccessful}, Mismatches={JsonSerializer.Serialize(trueSubstituteResult?.Mismatches)}";
+                    await LogError(errorMessage);
+                    if (request.Type == 0)
+                    {
+                        response.Errors.Add(new ErrorDto { TestId = testId, Message = errorMessage });
+                    }
+                    continue;
+                }
+                await LogDebug($"True substitute-values response: {JsonSerializer.Serialize(trueSubstituteResult)}");
+
                 var stepResults = new List<StepResultDto>();
                 var testStepResponses = new List<TestStepResponse>();
                 bool hasWrongStep = false;
                 int? wrongStepSequence = null;
-                int programMaxStep = substituteResult.Values.Any() ? substituteResult.Values.Max(sv => sv.Step) : 0;
+                int programMaxStep = trueSubstituteResult.Values.Any() ? trueSubstituteResult.Values.Max(sv => sv.Step) : 0;
                 int userMaxSequence = validSequences.Any() ? validSequences.Max(s => s.Sequence) : 0;
 
                 int mistakes = 0;
                 int userStepsCount = validSequences.Count;
                 int programStepsCount = programMaxStep;
                 int userAllVariablesCount = 0;
+
+                // Compare user steps with true program steps to detect step mismatches
+                var trueProgramSequences = trueSubstituteResult.Values
+                    .GroupBy(sv => sv.Step)
+                    .Select(g => new { Sequence = g.Key, Variables = g.ToList() })
+                    .OrderBy(g => g.Sequence)
+                    .ToList();
+
+                foreach (var (sequence, variables) in validSequences)
+                {
+                    var userStep = variables.First().Step;
+                    var trueProgramSequence = trueProgramSequences.FirstOrDefault(tps => tps.Sequence == sequence);
+                    if (trueProgramSequence == null)
+                    {
+                        if (request.Type == 0)
+                        {
+                            response.Errors.Add(new ErrorDto
+                            {
+                                TestId = testId,
+                                Sequence = sequence,
+                                Step = userStep,
+                                Message = $"User step {userStep} at sequence {sequence} does not exist in program execution"
+                            });
+                        }
+                        await LogDebug($"Step mismatch at sequence={sequence}: user step={userStep} not found in true program steps");
+                        hasWrongStep = true;
+                        wrongStepSequence = sequence;
+                        continue;
+                    }
+
+                    // Compare variables to ensure step alignment
+                    bool stepMismatch = false;
+                    foreach (var userVar in variables)
+                    {
+                        var trueVar = trueProgramSequence.Variables.FirstOrDefault(tv =>
+                            String.Equals(tv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
+                        if (trueVar == null)
+                        {
+                            stepMismatch = true;
+                            break;
+                        }
+                        // Optionally compare values if needed for stricter step validation
+                    }
+
+                    if (stepMismatch)
+                    {
+                        if (request.Type == 0)
+                        {
+                            response.Errors.Add(new ErrorDto
+                            {
+                                TestId = testId,
+                                Sequence = sequence,
+                                Step = userStep,
+                                Message = $"User step {userStep} at sequence {sequence} contains variables not matching true program step"
+                            });
+                        }
+                        await LogDebug($"Step mismatch at sequence={sequence}: user step={userStep} variables do not match true program step");
+                        hasWrongStep = true;
+                        wrongStepSequence = sequence;
+                    }
+                }
 
                 foreach (var (sequence, variables) in validSequences)
                 {
@@ -389,7 +482,7 @@ public class EvaluationController : ControllerBase
                 {
                     for (int step = userMaxSequence + 1; step <= programMaxStep; step++)
                     {
-                        var programVars = substituteResult.Values.Where(sv => sv.Step == step).ToList();
+                        var programVars = trueSubstituteResult.Values.Where(sv => sv.Step == step).ToList();
                         float totalElementsInSequence = 0f;
 
                         foreach (var programVar in programVars)
@@ -540,14 +633,8 @@ public class EvaluationController : ControllerBase
                     await LogDebug($"Removed {existingProgramSolution.Count} program solutions and {existingProgramVariables.Count} variables");
                 }
 
-                // Save program solution
-                var programSequences = substituteResult.Values
-                    .GroupBy(sv => sv.Step)
-                    .Select(g => new { Sequence = g.Key, Variables = g.ToList() })
-                    .OrderBy(g => g.Sequence)
-                    .ToList();
-
-                foreach (var sequence in programSequences)
+                // Save true program solution
+                foreach (var sequence in trueProgramSequences)
                 {
                     var step = sequence.Sequence; // Step corresponds to sequence in program context
                     var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
@@ -703,6 +790,8 @@ public class EvaluationController : ControllerBase
             });
         }
     }
+
+
 
     [HttpGet("get-user-mark/{sessionId}/{userId}")]
     public async Task<IActionResult> GetUserMarkBySessionId(int sessionId, int userId)

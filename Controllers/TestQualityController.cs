@@ -232,10 +232,26 @@ public class TestQualityController : ControllerBase
                 return BadRequest("Invalid test response.");
             }
 
-            var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-step/{test.AlgoId}");
+            var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{test.AlgoId}");
+            if (!algoStepsResponse.IsSuccessStatusCode)
+            {
+                await LogError($"Failed to fetch algo steps: algoId={test.AlgoId}, status={algoStepsResponse.StatusCode}");
+                return BadRequest($"Failed to fetch algo steps: algoId={test.AlgoId}");
+            }
+
             var algoStepsContent = await algoStepsResponse.Content.ReadAsStringAsync();
             await LogDebug($"Fetched algo steps for algoId={test.AlgoId}: {algoStepsContent}");
-            var algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+            List<AlgoStep> algoSteps;
+            try
+            {
+                algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+            }
+            catch (JsonException ex)
+            {
+                await LogError($"Failed to deserialize algo steps for algoId={test.AlgoId}: {ex.Message}");
+                algoSteps = new List<AlgoStep>();
+            }
+
             var stepDifficulties = algoSteps
                 .GroupBy(a => a.Step)
                 .ToDictionary(g => g.Key, g => g.OrderByDescending(a => a.AlgoId).First().Difficult);
