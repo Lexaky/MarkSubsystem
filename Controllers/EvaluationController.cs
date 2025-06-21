@@ -110,6 +110,33 @@ public class EvaluationController : ControllerBase
                 }
                 await LogDebug($"Algo variables: {JsonSerializer.Serialize(algoVariables)}");
 
+                // Fetch algo steps for difficulty
+                await LogDebug($"Fetching algo steps for algoId={testData.AlgoId}");
+                var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{testData.AlgoId}");
+                if (!algoStepsResponse.IsSuccessStatusCode)
+                {
+                    var errorMessage = $"Failed to fetch algo steps for algoId={testData.AlgoId}, status={algoStepsResponse.StatusCode}";
+                    await LogError(errorMessage);
+                    if (request.Type == 0)
+                    {
+                        response.Errors.Add(new ErrorDto { TestId = testId, Message = errorMessage });
+                    }
+                    continue;
+                }
+                var algoSteps = await algoStepsResponse.Content.ReadFromJsonAsync<List<AlgoStep>>();
+                if (algoSteps == null)
+                {
+                    var errorMessage = $"Invalid algo steps response for algoId={testData.AlgoId}";
+                    await LogError(errorMessage);
+                    if (request.Type == 0)
+                    {
+                        response.Errors.Add(new ErrorDto { TestId = testId, Message = errorMessage });
+                    }
+                    continue;
+                }
+                var stepDifficulties = algoSteps.ToDictionary(a => a.Step, a => a.Difficult);
+                await LogDebug($"Fetched algo steps: {JsonSerializer.Serialize(stepDifficulties)}");
+
                 float userAbility = await _context.UserTestAbilities
                     .Where(uta => uta.UserId == userId)
                     .AnyAsync()
@@ -206,6 +233,7 @@ public class EvaluationController : ControllerBase
                 int mistakes = 0;
                 int userStepsCount = validSequences.Count;
                 int programStepsCount = programMaxStep;
+                int userAllVariablesCount = 0;
 
                 foreach (var (sequence, variables) in validSequences)
                 {
@@ -213,6 +241,15 @@ public class EvaluationController : ControllerBase
                     bool isCorrect = true;
                     float correctElementsInSequence = 0f;
                     float totalElementsInSequence = 0f;
+
+                    foreach (var userVar in variables)
+                    {
+                        var substituteVar = substituteResult.Values.FirstOrDefault(sv =>
+                            sv.Step == sequence &&
+                            String.Equals(sv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
+                        int elementCount = CountElements(userVar.VariableValue, substituteVar?.Type ?? "Unknown", substituteVar?.Rank ?? 0);
+                        userAllVariablesCount += elementCount;
+                    }
 
                     if (!hasWrongStep)
                     {
@@ -395,13 +432,11 @@ public class EvaluationController : ControllerBase
                 float testScore = 0f;
                 if (userStepsCount > 0)
                 {
-                    float rawScore = 100f * (1f - (float)mistakes / userStepsCount) *
-                                     ((float)programStepsCount / userStepsCount) *
-                                     ((float)Math.Exp(-userAbility)) *
-                                     ((float)Math.Sqrt(1 + testData.Difficult));
+                    float rawScore = 100f * (1f - (float)mistakes / userAllVariablesCount) *
+                                     ((float)programStepsCount / userStepsCount);
                     testScore = Math.Max(0f, Math.Min(100f, rawScore));
                     testScores.Add(testScore);
-                    await LogDebug($"Test score for testId={testId}: mistakes={mistakes}, userSteps={userStepsCount}, algoSteps={programStepsCount}, ability={userAbility}, difficulty={testData.Difficult}, score={testScore}");
+                    await LogDebug($"Test score for testId={testId}: mistakes={mistakes}, userAllVariablesCount={userAllVariablesCount}, userSteps={userStepsCount}, programSteps={programStepsCount}, score={testScore}");
                 }
 
                 if (request.Type == 1) // Update user ability only for control sessions
@@ -441,46 +476,109 @@ public class EvaluationController : ControllerBase
                     }
                 }
 
-                var existingSolution = await _context.SolutionsByUsers
-                    .AnyAsync(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId);
-
-                if (!existingSolution)
+                // Check if user solution exists and remove it if present
+                var existingUserSolution = await _context.SolutionsByUsers
+                    .Where(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId)
+                    .ToListAsync();
+                if (existingUserSolution.Any())
                 {
-                    foreach (var (sequence, variables) in validSequences)
+                    await LogDebug($"Removing existing user solution for sessionId={sessionId}, userId={userId}, testId={testId}");
+                    var existingUserVariables = await _context.VariablesSolutionsByUsers
+                        .Where(v => v.TestId == testId && existingUserSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
+                        .ToListAsync();
+                    _context.VariablesSolutionsByUsers.RemoveRange(existingUserVariables);
+                    _context.SolutionsByUsers.RemoveRange(existingUserSolution);
+                    await _context.SaveChangesAsync();
+                    await LogDebug($"Removed {existingUserSolution.Count} user solutions and {existingUserVariables.Count} variables");
+                }
+
+                // Save user solution
+                foreach (var (sequence, variables) in validSequences)
+                {
+                    var step = variables.First().Step;
+                    var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
+                    var userStep = new SolutionsByUser
                     {
-                        var userStep = new SolutionsByUser
+                        SessionId = sessionId,
+                        UserId = userId,
+                        TestId = testId,
+                        UserStep = step,
+                        UserLineNumber = 1,
+                        OrderNumber = sequence,
+                        StepDifficult = stepDifficulty
+                    };
+                    _context.SolutionsByUsers.Add(userStep);
+
+                    foreach (var variable in variables)
+                    {
+                        var userVariable = new VariablesSolutionsByUsers
                         {
-                            SessionId = sessionId,
-                            UserId = userId,
-                            TestId = testId,
-                            UserStep = variables.First().Step,
+                            UserStep = step,
                             UserLineNumber = 1,
                             OrderNumber = sequence,
-                            StepDifficult = 0.5f
+                            TestId = testId,
+                            VarName = variable.VariableName,
+                            VarValue = variable.VariableValue
                         };
-                        _context.SolutionsByUsers.Add(userStep);
-
-                        foreach (var variable in variables)
-                        {
-                            var userVariable = new VariablesSolutionsByUsers
-                            {
-                                UserStep = variable.Step,
-                                UserLineNumber = 1,
-                                OrderNumber = sequence,
-                                TestId = testId,
-                                VarName = variable.VariableName,
-                                VarValue = variable.VariableValue
-                            };
-                            _context.VariablesSolutionsByUsers.Add(userVariable);
-                        }
+                        _context.VariablesSolutionsByUsers.Add(userVariable);
                     }
-                    await _context.SaveChangesAsync();
-                    await LogDebug($"Saved solutions for testId={testId}, userId={userId}, sessionId={sessionId}");
                 }
-                else
+
+                // Check if program solution exists and remove it if present
+                var existingProgramSolution = await _context.SolutionsByPrograms
+                    .Where(s => s.SessionId == sessionId && s.TestId == testId)
+                    .ToListAsync();
+                if (existingProgramSolution.Any())
                 {
-                    await LogDebug($"Solution already exists for sessionId={sessionId}, userId={userId}, testId={testId}. Skipping save.");
+                    await LogDebug($"Removing existing program solution for sessionId={sessionId}, testId={testId}");
+                    var existingProgramVariables = await _context.VariablesSolutionsByPrograms
+                        .Where(v => v.TestId == testId && existingProgramSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
+                        .ToListAsync();
+                    _context.VariablesSolutionsByPrograms.RemoveRange(existingProgramVariables);
+                    _context.SolutionsByPrograms.RemoveRange(existingProgramSolution);
+                    await _context.SaveChangesAsync();
+                    await LogDebug($"Removed {existingProgramSolution.Count} program solutions and {existingProgramVariables.Count} variables");
                 }
+
+                // Save program solution
+                var programSequences = substituteResult.Values
+                    .GroupBy(sv => sv.Step)
+                    .Select(g => new { Sequence = g.Key, Variables = g.ToList() })
+                    .OrderBy(g => g.Sequence)
+                    .ToList();
+
+                foreach (var sequence in programSequences)
+                {
+                    var step = sequence.Sequence; // Step corresponds to sequence in program context
+                    var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
+                    var programStep = new SolutionsByProgram
+                    {
+                        SessionId = sessionId,
+                        TestId = testId,
+                        ProgramStep = step,
+                        ProgramLineNumber = 1,
+                        OrderNumber = step,
+                        StepDifficult = stepDifficulty
+                    };
+                    _context.SolutionsByPrograms.Add(programStep);
+
+                    foreach (var variable in sequence.Variables)
+                    {
+                        var programVariable = new VariablesSolutionsByProgram
+                        {
+                            ProgramStep = step,
+                            ProgramLineNumber = 1,
+                            OrderNumber = step,
+                            TestId = testId,
+                            VarName = variable.VariableName,
+                            VarValue = variable.Value
+                        };
+                        _context.VariablesSolutionsByPrograms.Add(programVariable);
+                    }
+                }
+
+                await _context.SaveChangesAsync();
+                await LogDebug($"Saved solutions for testId={testId}, userId={userId}, sessionId={sessionId}");
 
                 var updateStepResponse = new UpdateStepResponseDto
                 {
@@ -605,6 +703,86 @@ public class EvaluationController : ControllerBase
             });
         }
     }
+
+    [HttpGet("get-user-mark/{sessionId}/{userId}")]
+    public async Task<IActionResult> GetUserMarkBySessionId(int sessionId, int userId)
+    {
+        try
+        {
+            await LogDebug($"Fetching mark for userId={userId}, sessionId={sessionId}");
+            var grade = await _context.Grades
+                .FirstOrDefaultAsync(g => g.UserId == userId && g.SessionId == sessionId);
+
+            if (grade == null)
+            {
+                var errorMessage = $"No grade found for userId={userId}, sessionId={sessionId}";
+                await LogError(errorMessage);
+                return NotFound(errorMessage);
+            }
+
+            await LogDebug($"Found mark: userId={userId}, sessionId={sessionId}, mark={grade.Mark}");
+            return Ok(new { Mark = grade.Mark });
+        }
+        catch (Exception ex)
+        {
+            await LogError($"Exception in GetUserMarkBySessionId: {ex.Message}");
+            return StatusCode(500, $"Internal server error: {ex.Message}");
+        }
+    }
+
+    [HttpGet("get-statistics/{sessionId}/{userId}")]
+    public async Task<IActionResult> GetStatisticsForUser(int sessionId, int userId)
+    {
+        try
+        {
+            await LogDebug($"Fetching statistics for userId={userId}, sessionId={sessionId}");
+
+            var solutions = await _context.SolutionsByUsers
+                .Where(s => s.SessionId == sessionId && s.UserId == userId)
+                .Join(_context.VariablesSolutionsByUsers,
+                    s => new { s.TestId, s.OrderNumber, s.UserStep },
+                    v => new { v.TestId, v.OrderNumber, v.UserStep },
+                    (s, v) => new
+                    {
+                        s.TestId,
+                        s.OrderNumber,
+                        s.UserStep,
+                        s.StepDifficult,
+                        VariableName = v.VarName,
+                        VariableValue = v.VarValue
+                    })
+                .GroupBy(x => new { x.TestId, x.OrderNumber, x.UserStep, x.StepDifficult })
+                .Select(g => new UserSolutionNewDto
+                {
+                    TestId = g.Key.TestId,
+                    Sequence = g.Key.OrderNumber,
+                    Step = g.Key.UserStep,
+                    StepDifficulty = g.Key.StepDifficult,
+                    Variables = g.Select(v => new UserVariableDto
+                    {
+                        Name = v.VariableName,
+                        Value = v.VariableValue
+                    }).ToList()
+                })
+                .ToListAsync();
+
+            if (!solutions.Any())
+            {
+                var errorMessage = $"No solutions found for userId={userId}, sessionId={sessionId}";
+                await LogError(errorMessage);
+                return NotFound(errorMessage);
+            }
+
+            await LogDebug($"Found {solutions.Count} solutions for userId={userId}, sessionId={sessionId}");
+            return Ok(solutions);
+        }
+        catch (Exception ex)
+        {
+            await LogError($"Exception in GetStatisticsForUser: {ex.Message}");
+            return StatusCode(500, $"Internal server error: {ex.Message}");
+        }
+    }
+
     private (float matches, float total) CompareValues(string? userValue, string? substituteValue, string type, int rank)
     {
         float matches = 0f;
@@ -806,4 +984,20 @@ public class MetaDto
 {
     public List<object> UserSteps { get; set; } = new List<object>();
     public List<object> ProgramSteps { get; set; } = new List<object>();
+}
+
+// DTO для статистики пользователя
+public class UserSolutionNewDto
+{
+    public int TestId { get; set; }
+    public int Sequence { get; set; }
+    public int Step { get; set; }
+    public float StepDifficulty { get; set; }
+    public List<UserVariableDto> Variables { get; set; } = new List<UserVariableDto>();
+}
+
+public class UserVariableDto
+{
+    public string Name { get; set; } = string.Empty;
+    public string Value { get; set; } = string.Empty;
 }
