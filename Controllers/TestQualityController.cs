@@ -76,46 +76,66 @@ public class TestQualityController : ControllerBase
     {
         try
         {
+            if (updates == null || !updates.Any())
+            {
+                await LogDebug("No updates provided for quality parameters.");
+                return Ok();
+            }
+
             foreach (var update in updates)
             {
                 await LogDebug($"Updating quality parameters for testId={update.TestId}, algoId={update.AlgoId}");
 
-                var testResponse = await _httpClient.GetAsync(($"{_testManagementUrl}/fetch-test/{update.TestId}"));
-                if (!testResponse!.IsSuccessStatusCode)
+                var testResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-test/{update.TestId}");
+                if (!testResponse.IsSuccessStatusCode)
                 {
-                    await LogError($"Test not found: {update.TestId}, status={testResponse.StatusCode}");
+                    await LogError($"Test not found: testId={update.TestId}, status={testResponse.StatusCode}");
                     continue;
                 }
 
                 var test = await testResponse.Content.ReadFromJsonAsync<Test>();
-                if (test == null || test!.AlgoId != update.AlgoId)
+                if (test == null || test.AlgoId != update.AlgoId)
                 {
                     await LogError($"Invalid test or AlgoId mismatch: testId={update.TestId}, algoId={update.AlgoId}");
                     continue;
                 }
 
-                var stepResponsesResponse = await _httpClient.GetAsync(($"{_testManagementUrl}/fetch-step-responses/{update.TestId}"));
+                var stepResponsesResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-step-responses/{update.TestId}");
                 var stepResponsesContent = await stepResponsesResponse.Content.ReadAsStringAsync();
                 await LogDebug($"Fetched step responses for testId={test.TestId}: {stepResponsesContent}");
-                var testStepResponses = JsonSerializer.Deserialize<List<TestStepResponse>>(stepResponsesContent) ?? new List<TestStepResponse>();
-
-                if (!testStepResponses.Any() && !update.StepResults.Any())
+                List<TestStepResponse> testStepResponses;
+                try
                 {
-                    await LogError($"No step responses available for testId={test.TestId}");
-                    continue;
+                    testStepResponses = JsonSerializer.Deserialize<List<TestStepResponse>>(stepResponsesContent) ?? new List<TestStepResponse>();
+                }
+                catch (JsonException ex)
+                {
+                    await LogError($"Failed to deserialize step responses for testId={update.TestId}: {ex.Message}");
+                    testStepResponses = new List<TestStepResponse>();
                 }
 
-                var algoStepsResponse = await _httpClient.GetAsync(($"{_testManagementUrl}/fetch-algo-steps/{update.AlgoId}"));
-                if (!algoStepsResponse!.IsSuccessStatusCode)
+                var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{update.AlgoId}");
+                if (!algoStepsResponse.IsSuccessStatusCode)
                 {
                     await LogError($"Failed to fetch algo steps: algoId={update.AlgoId}, status={algoStepsResponse.StatusCode}");
                     continue;
                 }
 
-                var algoSteps = await algoStepsResponse.Content.ReadFromJsonAsync<List<AlgoStep>>();
-                if (algoSteps!.Any() || !algoSteps.Any())
+                var algoStepsContent = await algoStepsResponse.Content.ReadAsStringAsync();
+                List<AlgoStep> algoSteps;
+                try
                 {
-                    await LogError($"No algo steps found: {update.AlgoId}");
+                    algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+                }
+                catch (JsonException ex)
+                {
+                    await LogError($"Failed to deserialize algo steps for algoId={update.AlgoId}: {ex.Message}");
+                    algoSteps = new List<AlgoStep>();
+                }
+
+                if (!algoSteps.Any())
+                {
+                    await LogError($"No algo steps found for algoId={update.AlgoId}");
                     continue;
                 }
 
@@ -123,7 +143,7 @@ public class TestQualityController : ControllerBase
 
                 foreach (var stepResult in update.StepResults)
                 {
-                    var stepResponse = testStepResponses!.FirstOrDefault(s => s.TestId == update.TestId && s.AlgoStep == stepResult.Step);
+                    var stepResponse = testStepResponses.FirstOrDefault(s => s.TestId == update.TestId && s.AlgoStep == stepResult.Step);
                     if (stepResponse == null)
                     {
                         stepResponse = new TestStepResponse
@@ -135,6 +155,11 @@ public class TestQualityController : ControllerBase
                             IncorrectCount = stepResult.IsCorrect ? 0 : 1
                         };
                         testStepResponses.Add(stepResponse);
+                    }
+                    else
+                    {
+                        stepResponse.CorrectCount += stepResult.IsCorrect ? 1 : 0;
+                        stepResponse.IncorrectCount += stepResult.IsCorrect ? 0 : 1;
                     }
 
                     float stepDifficulty = 0f;
@@ -155,21 +180,27 @@ public class TestQualityController : ControllerBase
                             Difficult = Math.Min(Math.Max(normalizedStepDifficulty, 0f), 1f)
                         }), Encoding.UTF8, "application/json");
 
-                    var algoStepResponse = await _httpClient.PutAsync($"{_testManagementUrl}/modify-algo-step/{update.AlgoId}/{stepResult}", algoStepContent);
-                    if (!algoStepResponse!.IsSuccessStatusCode)
+                    var algoStepResponse = await _httpClient.PutAsync($"{_testManagementUrl}/modify-algo-step/{update.AlgoId}/{stepResult.Step}", algoStepContent);
+                    if (!algoStepResponse.IsSuccessStatusCode)
                     {
                         var errorContent = await algoStepResponse.Content.ReadAsStringAsync();
                         await LogError($"Failed to update algo step: algoId={update.AlgoId}, step={stepResult.Step}, status={algoStepResponse.StatusCode}, response={errorContent}");
                     }
                     else
                     {
-                        await LogDebug($"Updated algo step: algoId={update.AlgoId}, step={stepResult}, difficulty={normalizedStepDifficulty}");
+                        await LogDebug($"Updated algo step: algoId={update.AlgoId}, step={stepResult.Step}, difficulty={normalizedStepDifficulty}");
                     }
+                }
+
+                if (!update.StepResults.Any())
+                {
+                    await LogDebug($"No step results provided for testId={update.TestId}, skipping further updates.");
+                    continue;
                 }
 
                 var stepResponsesContentStatus = new StringContent(JsonSerializer.Serialize(testStepResponses), Encoding.UTF8, "application/json");
                 var stepResponses = await _httpClient.PutAsync($"{_testManagementUrl}/modify-step-responses/{update.TestId}", stepResponsesContentStatus);
-                if (!stepResponses!.IsSuccessStatusCode)
+                if (!stepResponses.IsSuccessStatusCode)
                 {
                     var errorContent = await stepResponses.Content.ReadAsStringAsync();
                     await LogError($"Failed to update test step responses: testId={update.TestId}, status={stepResponses.StatusCode}, response={errorContent}");
@@ -180,7 +211,7 @@ public class TestQualityController : ControllerBase
                     await LogDebug($"Updated test step responses for testId={update.TestId}");
                 }
 
-                float testDifficulty = normalizedStepDifficulties!.Any() ? normalizedStepDifficulties.Average() : 0f;
+                float testDifficulty = normalizedStepDifficulties.Any() ? normalizedStepDifficulties.Average() : test.Difficult;
                 float normalizedTestDifficulty = Math.Min(Math.Max(testDifficulty, 0f), 1f);
 
                 var testContent = new StringContent(JsonSerializer.Serialize(new
@@ -190,9 +221,9 @@ public class TestQualityController : ControllerBase
                 }), Encoding.UTF8, "application/json");
 
                 var testResponseStatus = await _httpClient.PutAsync($"{_testManagementUrl}/modify-test/{update.TestId}", testContent);
-                if (!testResponseStatus!.IsSuccessStatusCode)
+                if (!testResponseStatus.IsSuccessStatusCode)
                 {
-                    var errorContent = await testResponse.Content.ReadAsStringAsync();
+                    var errorContent = await testResponseStatus.Content.ReadAsStringAsync();
                     await LogError($"Failed to update test difficulty: testId={update.TestId}, status={testResponseStatus.StatusCode}, response={errorContent}");
                     continue;
                 }
@@ -202,7 +233,7 @@ public class TestQualityController : ControllerBase
                 }
             }
 
-            await LogSuccess($"Updated quality parameters for {updates!.Count} tests");
+            await LogSuccess($"Updated quality parameters for {updates.Count} tests");
             return Ok();
         }
         catch (Exception ex)
@@ -211,7 +242,6 @@ public class TestQualityController : ControllerBase
             return StatusCode(500, $"Internal server error: {ex.Message}");
         }
     }
-
 
     [HttpGet("get-test-parameters/{testId}")]
     public async Task<IActionResult> GetTestParameters(int testId)
@@ -290,7 +320,7 @@ public class TestQualityController : ControllerBase
             var test = await testResponse.Content.ReadFromJsonAsync<Test>();
             if (test == null)
             {
-                await LogError($"Invalid test response: {testId}");
+                await LogError($"Invalid test response: testId={testId}");
                 return BadRequest("Invalid test response.");
             }
 
@@ -377,9 +407,9 @@ public class TestQualityController : ControllerBase
                 int userStepCount = userSteps.Count();
                 int programStepCount = programSteps.Count();
                 float userAbility = await _usersDbContext.UserTestAbilities
-    .Where(uta => uta.UserId == userId && uta.TestId == testId)
-    .Select(uta => uta.Ability)
-    .FirstOrDefaultAsync();
+                    .Where(uta => uta.UserId == userId && uta.TestId == testId)
+                    .Select(uta => uta.Ability)
+                    .FirstOrDefaultAsync();
 
                 float rawScore = 100f * (1f - (float)mismatchCount / userStepCount) *
                                 ((float)programStepCount / userStepCount) *
@@ -392,7 +422,17 @@ public class TestQualityController : ControllerBase
             var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{test.AlgoId}");
             var algoStepsContent = await algoStepsResponse.Content.ReadAsStringAsync();
             await LogDebug($"Fetched algo steps for algoId={test.AlgoId}: {algoStepsContent}");
-            var algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+            List<AlgoStep> algoSteps;
+            try
+            {
+                algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+            }
+            catch (JsonException ex)
+            {
+                await LogError($"Failed to deserialize algo steps for algoId={test.AlgoId}: {ex.Message}");
+                algoSteps = new List<AlgoStep>();
+            }
+
             var stepDifficulties = algoSteps
                 .GroupBy(a => a.Step)
                 .ToDictionary(g => g.Key, g => g.OrderByDescending(a => a.AlgoId).First().Difficult);
@@ -419,6 +459,7 @@ public class TestQualityController : ControllerBase
             return StatusCode(500, $"Internal server error: {ex.Message}");
         }
     }
+
 
     private async Task LogDebug(string message)
     {
