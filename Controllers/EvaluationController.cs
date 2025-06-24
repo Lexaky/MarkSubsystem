@@ -110,7 +110,6 @@ public class EvaluationController : ControllerBase
                 }
                 await LogDebug($"Algo variables: {JsonSerializer.Serialize(algoVariables)}");
 
-                // Fetch algo steps for difficulty
                 await LogDebug($"Fetching algo steps for algoId={testData.AlgoId}");
                 var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{testData.AlgoId}");
                 if (!algoStepsResponse.IsSuccessStatusCode)
@@ -223,7 +222,6 @@ public class EvaluationController : ControllerBase
                 }
                 await LogDebug($"Substitute-values response: {JsonSerializer.Serialize(substituteResult)}");
 
-                // Fetch true program values by sending "-" to substitute-values
                 using var trueContent = new MultipartFormDataContent();
                 var trueFileStream = new MemoryStream(Encoding.UTF8.GetBytes("-"));
                 trueContent.Add(new StreamContent(trueFileStream), "userDataFile", "input.txt");
@@ -257,29 +255,32 @@ public class EvaluationController : ControllerBase
 
                 var stepResults = new List<StepResultDto>();
                 var testStepResponses = new List<TestStepResponse>();
-                bool hasWrongStep = false;
-                int? wrongStepSequence = null;
+                int mistakes = 0;
+                int userAllVariablesCount = 0;
+
                 int programMaxStep = trueSubstituteResult.Values.Any() ? trueSubstituteResult.Values.Max(sv => sv.Step) : 0;
                 int userMaxSequence = validSequences.Any() ? validSequences.Max(s => s.Sequence) : 0;
 
-                int mistakes = 0;
-                int userStepsCount = validSequences.Count;
-                int programStepsCount = programMaxStep;
-                int userAllVariablesCount = 0;
-
-                // Compare user steps with true program steps to detect step mismatches
                 var trueProgramSequences = trueSubstituteResult.Values
                     .GroupBy(sv => sv.Step)
                     .Select(g => new { Sequence = g.Key, Variables = g.ToList() })
                     .OrderBy(g => g.Sequence)
                     .ToList();
 
+                // Проверяем шаги и переменные, собирая все ошибки
                 foreach (var (sequence, variables) in validSequences)
                 {
                     var userStep = variables.First().Step;
+                    bool isCorrect = true;
+                    float correctElementsInSequence = 0f;
+                    float totalElementsInSequence = 0f;
+
+                    // Проверка соответствия шага
                     var trueProgramSequence = trueProgramSequences.FirstOrDefault(tps => tps.Sequence == sequence);
                     if (trueProgramSequence == null)
                     {
+                        isCorrect = false;
+                        mistakes++;
                         if (request.Type == 0)
                         {
                             response.Errors.Add(new ErrorDto
@@ -291,66 +292,23 @@ public class EvaluationController : ControllerBase
                             });
                         }
                         await LogDebug($"Step mismatch at sequence={sequence}: user step={userStep} not found in true program steps");
-                        hasWrongStep = true;
-                        wrongStepSequence = sequence;
-                        continue;
                     }
-
-                    // Compare variables to ensure step alignment
-                    bool stepMismatch = false;
-                    foreach (var userVar in variables)
+                    else
                     {
-                        var trueVar = trueProgramSequence.Variables.FirstOrDefault(tv =>
-                            String.Equals(tv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
-                        if (trueVar == null)
+                        // Проверка переменных для соответствия шага
+                        bool stepMismatch = false;
+                        foreach (var userVar in variables)
                         {
-                            stepMismatch = true;
-                            break;
-                        }
-                        // Optionally compare values if needed for stricter step validation
-                    }
-
-                    if (stepMismatch)
-                    {
-                        if (request.Type == 0)
-                        {
-                            response.Errors.Add(new ErrorDto
+                            var trueVar = trueProgramSequence.Variables.FirstOrDefault(tv =>
+                                String.Equals(tv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
+                            if (trueVar == null)
                             {
-                                TestId = testId,
-                                Sequence = sequence,
-                                Step = userStep,
-                                Message = $"User step {userStep} at sequence {sequence} contains variables not matching true program step"
-                            });
+                                stepMismatch = true;
+                                break;
+                            }
                         }
-                        await LogDebug($"Step mismatch at sequence={sequence}: user step={userStep} variables do not match true program step");
-                        hasWrongStep = true;
-                        wrongStepSequence = sequence;
-                    }
-                }
-
-                foreach (var (sequence, variables) in validSequences)
-                {
-                    var step = variables.First().Step;
-                    bool isCorrect = true;
-                    float correctElementsInSequence = 0f;
-                    float totalElementsInSequence = 0f;
-
-                    foreach (var userVar in variables)
-                    {
-                        var substituteVar = substituteResult.Values.FirstOrDefault(sv =>
-                            sv.Step == sequence &&
-                            String.Equals(sv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
-                        int elementCount = CountElements(userVar.VariableValue, substituteVar?.Type ?? "Unknown", substituteVar?.Rank ?? 0);
-                        userAllVariablesCount += elementCount;
-                    }
-
-                    if (!hasWrongStep)
-                    {
-                        var expectedAlgoVar = algoVariables.FirstOrDefault(av => av.Step == step && av.LineNumber == substituteResult.Values.FirstOrDefault(sv => sv.Step == sequence && sv.VariableName == variables.First().VariableName)?.TrackerHitId);
-                        if (expectedAlgoVar == null)
+                        if (stepMismatch)
                         {
-                            hasWrongStep = true;
-                            wrongStepSequence = sequence;
                             isCorrect = false;
                             mistakes++;
                             if (request.Type == 0)
@@ -359,98 +317,100 @@ public class EvaluationController : ControllerBase
                                 {
                                     TestId = testId,
                                     Sequence = sequence,
-                                    Step = step,
-                                    Message = $"Неверный номер шага: нет записи в algoVariables для step={step} и sequence={sequence}"
+                                    Step = userStep,
+                                    Message = $"User step {userStep} at sequence {sequence} contains variables not matching true program step"
                                 });
                             }
-                            await LogDebug($"Wrong AlgoStep detected at sequence={sequence}: no matching algoVariable for step={step}");
+                            await LogDebug($"Step mismatch at sequence={sequence}: user step={userStep} variables do not match true program step");
                         }
                     }
 
-                    if (hasWrongStep || sequence > programMaxStep)
+                    // Проверка значений переменных
+                    foreach (var userVar in variables.OrderBy(v => v.VariableName))
+                    {
+                        var substituteVar = substituteResult.Values.FirstOrDefault(sv =>
+                            sv.Step == sequence &&
+                            String.Equals(sv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
+
+                        int elementCount = CountElements(userVar.VariableValue, substituteVar?.Type ?? "Unknown", substituteVar?.Rank ?? 0);
+                        userAllVariablesCount += elementCount;
+                        totalElementsInSequence += elementCount;
+
+                        if (substituteVar == null)
+                        {
+                            isCorrect = false;
+                            mistakes++;
+                            if (request.Type == 0)
+                            {
+                                response.Errors.Add(new ErrorDto
+                                {
+                                    TestId = testId,
+                                    Sequence = sequence,
+                                    Step = userStep,
+                                    VariableName = userVar.VariableName,
+                                    Message = $"No matching value in substitute-values for {userVar.VariableName} at sequence={sequence}"
+                                });
+                            }
+                            await LogDebug($"No matching value for sequence={sequence}, variable={userVar.VariableName}, elements={elementCount}");
+                            continue;
+                        }
+
+                        var userValue = userVar.VariableValue?.Trim();
+                        var substituteValue = substituteVar.Value?.Trim();
+                        var userBytes = userValue != null ? BitConverter.ToString(Encoding.UTF8.GetBytes(userValue)).Replace("-", "") : "null";
+                        var substituteBytes = substituteValue != null ? BitConverter.ToString(Encoding.UTF8.GetBytes(substituteValue)).Replace("-", "") : "null";
+
+                        await LogDebug($"Comparing: sequence={sequence}, algoStep={userStep}, userVar={userVar.VariableName}, userValue={userValue}, userBytes={userBytes}, substituteVar={substituteVar.VariableName}, substituteValue={substituteValue}, substituteBytes={substituteBytes}, substituteStep={substituteVar.Step}");
+
+                        var (matches, total) = CompareValues(userValue, substituteValue, substituteVar.Type, substituteVar.Rank);
+                        correctElementsInSequence += matches;
+                        totalElementsInSequence += total;
+
+                        if (matches < total)
+                        {
+                            isCorrect = false;
+                            mistakes += (int)(total - matches);
+                            if (request.Type == 0)
+                            {
+                                response.Errors.Add(new ErrorDto
+                                {
+                                    TestId = testId,
+                                    Sequence = sequence,
+                                    Step = userStep,
+                                    VariableName = userVar.VariableName,
+                                    Message = $"Incorrect value for {userVar.VariableName}: expected {substituteValue}, got {userValue}, mismatches={total - matches}"
+                                });
+                            }
+                            await LogDebug($"Mismatch: sequence={sequence}, algoStep={userStep}, userVar={userVar.VariableName}, expected={substituteValue}, got={userValue}, userBytes={userBytes}, substituteBytes={substituteBytes}, mismatches={total - matches}");
+                        }
+                        else
+                        {
+                            await LogDebug($"Match: sequence={sequence}, algoStep={userStep}, userVar={userVar.VariableName}, value={userValue}, bytes={userBytes}, elements={total}");
+                        }
+                    }
+
+                    // Проверка algoVariables
+                    var expectedAlgoVar = algoVariables.FirstOrDefault(av => av.Step == userStep && av.LineNumber == substituteResult.Values.FirstOrDefault(sv => sv.Step == sequence && sv.VariableName == variables.First().VariableName)?.TrackerHitId);
+                    if (expectedAlgoVar == null)
                     {
                         isCorrect = false;
                         mistakes++;
-                        foreach (var userVar in variables)
+                        if (request.Type == 0)
                         {
-                            var substituteVar = substituteResult.Values.FirstOrDefault(sv =>
-                                sv.Step == sequence &&
-                                String.Equals(sv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
-
-                            int elementCount = CountElements(userVar.VariableValue, substituteVar?.Type, substituteVar?.Rank ?? 0);
-                            totalElementsInSequence += elementCount;
-                            await LogDebug($"Sequence={sequence} marked as error due to wrong AlgoStep or excess: variable={userVar.VariableName}, elements={elementCount}");
+                            response.Errors.Add(new ErrorDto
+                            {
+                                TestId = testId,
+                                Sequence = sequence,
+                                Step = userStep,
+                                Message = $"Неверный номер шага: нет записи в algoVariables для step={userStep} и sequence={sequence}"
+                            });
                         }
-                    }
-                    else
-                    {
-                        await LogDebug($"Comparing sequence={sequence}, algoStep={step}");
-
-                        foreach (var userVar in variables.OrderBy(v => v.VariableName))
-                        {
-                            var substituteVar = substituteResult.Values.FirstOrDefault(sv =>
-                                sv.Step == sequence &&
-                                String.Equals(sv.VariableName, userVar.VariableName, StringComparison.OrdinalIgnoreCase));
-
-                            if (substituteVar == null)
-                            {
-                                isCorrect = false;
-                                mistakes++;
-                                int elementCount = CountElements(userVar.VariableValue, "Unknown", 0);
-                                totalElementsInSequence += elementCount;
-                                if (request.Type == 0)
-                                {
-                                    response.Errors.Add(new ErrorDto
-                                    {
-                                        TestId = testId,
-                                        Sequence = sequence,
-                                        Step = step,
-                                        VariableName = userVar.VariableName,
-                                        Message = $"No matching value in substitute-values for {userVar.VariableName} at sequence={sequence}"
-                                    });
-                                }
-                                await LogDebug($"No matching value for sequence={sequence}, variable={userVar.VariableName}, elements={elementCount}");
-                                continue;
-                            }
-
-                            var userValue = userVar.VariableValue?.Trim();
-                            var substituteValue = substituteVar.Value?.Trim();
-                            var userBytes = userValue != null ? BitConverter.ToString(Encoding.UTF8.GetBytes(userValue)).Replace("-", "") : "null";
-                            var substituteBytes = substituteValue != null ? BitConverter.ToString(Encoding.UTF8.GetBytes(substituteValue)).Replace("-", "") : "null";
-
-                            await LogDebug($"Comparing: sequence={sequence}, algoStep={step}, userVar={userVar.VariableName}, userValue={userValue}, userBytes={userBytes}, substituteVar={substituteVar.VariableName}, substituteValue={substituteValue}, substituteBytes={substituteBytes}, substituteStep={substituteVar.Step}");
-
-                            var (matches, total) = CompareValues(userValue, substituteValue, substituteVar.Type, substituteVar.Rank);
-                            correctElementsInSequence += matches;
-                            totalElementsInSequence += total;
-
-                            if (matches < total)
-                            {
-                                isCorrect = false;
-                                mistakes += (int)(total - matches);
-                                if (request.Type == 0)
-                                {
-                                    response.Errors.Add(new ErrorDto
-                                    {
-                                        TestId = testId,
-                                        Sequence = sequence,
-                                        Step = step,
-                                        VariableName = userVar.VariableName,
-                                        Message = $"Incorrect value for {userVar.VariableName}: expected {substituteValue}, got {userValue}, mismatches={total - matches}"
-                                    });
-                                }
-                                await LogDebug($"Mismatch: sequence={sequence}, algoStep={step}, userVar={userVar.VariableName}, expected={substituteValue}, got={userValue}, userBytes={userBytes}, substituteBytes={substituteBytes}, mismatches={total - matches}");
-                            }
-                            else
-                            {
-                                await LogDebug($"Match: sequence={sequence}, algoStep={step}, userVar={userVar.VariableName}, value={userValue}, bytes={userBytes}, elements={total}");
-                            }
-                        }
+                        await LogDebug($"Wrong AlgoStep detected at sequence={sequence}: no matching algoVariable for step={userStep}");
                     }
 
                     stepResults.Add(new StepResultDto
                     {
-                        Step = step,
+                        Step = userStep,
                         IsCorrect = isCorrect
                     });
 
@@ -458,24 +418,36 @@ public class EvaluationController : ControllerBase
                     {
                         TestId = testId,
                         AlgoId = testData.AlgoId,
-                        AlgoStep = step,
+                        AlgoStep = userStep,
                         CorrectCount = isCorrect ? 1 : 0,
                         IncorrectCount = isCorrect ? 0 : 1
                     });
 
-                    await LogDebug($"Sequence={sequence}, algoStep={step}, isCorrect={isCorrect}, correctElements={correctElementsInSequence}, totalElements={totalElementsInSequence}");
+                    await LogDebug($"Sequence={sequence}, algoStep={userStep}, isCorrect={isCorrect}, correctElements={correctElementsInSequence}, totalElements={totalElementsInSequence}");
                 }
 
-                if (userMaxSequence > programMaxStep && request.Type == 0)
+                if (userMaxSequence > programMaxStep)
                 {
-                    response.Errors.Add(new ErrorDto
+                    for (int sequence = programMaxStep + 1; sequence <= userMaxSequence; sequence++)
                     {
-                        TestId = testId,
-                        Sequence = programMaxStep + 1,
-                        Message = $"Пользователь имеет лишние шаги, начиная с sequence={programMaxStep + 1}"
-                    });
-                    mistakes += userMaxSequence - programMaxStep;
-                    await LogDebug($"User has excess steps starting from sequence={programMaxStep + 1}");
+                        var userSequence = validSequences.FirstOrDefault(s => s.Sequence == sequence);
+                        if (userSequence.Variables != null)
+                        {
+                            var step = userSequence.Variables.First().Step;
+                            if (request.Type == 0)
+                            {
+                                response.Errors.Add(new ErrorDto
+                                {
+                                    TestId = testId,
+                                    Sequence = sequence,
+                                    Step = step,
+                                    Message = $"Пользователь имеет лишний шаг sequence={sequence}"
+                                });
+                            }
+                            mistakes++;
+                            await LogDebug($"User has excess step at sequence={sequence}");
+                        }
+                    }
                 }
 
                 if (programMaxStep > userMaxSequence)
@@ -508,21 +480,22 @@ public class EvaluationController : ControllerBase
                             IncorrectCount = 1
                         });
 
-                        await LogDebug($"Missing sequence={step}, algoStep=0, isCorrect=false, totalElements={totalElementsInSequence}");
-                    }
-
-                    if (request.Type == 0)
-                    {
-                        response.Errors.Add(new ErrorDto
+                        if (request.Type == 0)
                         {
-                            TestId = testId,
-                            Message = "Пользователь не закончил решение"
-                        });
-                        await LogDebug("User has fewer steps than program");
+                            response.Errors.Add(new ErrorDto
+                            {
+                                TestId = testId,
+                                Sequence = step,
+                                Message = $"Пользователь пропустил шаг sequence={step}"
+                            });
+                        }
+                        await LogDebug($"Missing sequence={step}, algoStep=0, isCorrect=false, totalElements={totalElementsInSequence}");
                     }
                 }
 
                 float testScore = 0f;
+                int userStepsCount = validSequences.Count;
+                int programStepsCount = programMaxStep;
                 if (userStepsCount > 0)
                 {
                     float rawScore = 100f * (1f - (float)mistakes / userAllVariablesCount) *
@@ -532,7 +505,7 @@ public class EvaluationController : ControllerBase
                     await LogDebug($"Test score for testId={testId}: mistakes={mistakes}, userAllVariablesCount={userAllVariablesCount}, userSteps={userStepsCount}, programSteps={programStepsCount}, score={testScore}");
                 }
 
-                if (request.Type == 1) // Update user ability only for control sessions
+                if (request.Type == 1)
                 {
                     float correctTotal = testStepResponses.Sum(r => r.CorrectCount);
                     float incorrectTotal = testStepResponses.Sum(r => r.IncorrectCount);
@@ -569,7 +542,6 @@ public class EvaluationController : ControllerBase
                     }
                 }
 
-                // Check if user solution exists and remove it if present
                 var existingUserSolution = await _context.SolutionsByUsers
                     .Where(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId)
                     .ToListAsync();
@@ -585,7 +557,6 @@ public class EvaluationController : ControllerBase
                     await LogDebug($"Removed {existingUserSolution.Count} user solutions and {existingUserVariables.Count} variables");
                 }
 
-                // Save user solution
                 foreach (var (sequence, variables) in validSequences)
                 {
                     var step = variables.First().Step;
@@ -617,7 +588,6 @@ public class EvaluationController : ControllerBase
                     }
                 }
 
-                // Check if program solution exists and remove it if present
                 var existingProgramSolution = await _context.SolutionsByPrograms
                     .Where(s => s.SessionId == sessionId && s.TestId == testId)
                     .ToListAsync();
@@ -633,10 +603,9 @@ public class EvaluationController : ControllerBase
                     await LogDebug($"Removed {existingProgramSolution.Count} program solutions and {existingProgramVariables.Count} variables");
                 }
 
-                // Save true program solution
                 foreach (var sequence in trueProgramSequences)
                 {
-                    var step = sequence.Sequence; // Step corresponds to sequence in program context
+                    var step = sequence.Sequence;
                     var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
                     var programStep = new SolutionsByProgram
                     {
@@ -674,7 +643,7 @@ public class EvaluationController : ControllerBase
                     StepResults = stepResults
                 };
 
-                if (request.Type == 1) // Send step responses and quality updates only for control sessions
+                if (request.Type == 1)
                 {
                     var stepResponsesUpdateContent = new StringContent(
                         JsonSerializer.Serialize(testStepResponses),
@@ -790,7 +759,6 @@ public class EvaluationController : ControllerBase
             });
         }
     }
-
 
 
     [HttpGet("get-user-mark/{sessionId}/{userId}")]
