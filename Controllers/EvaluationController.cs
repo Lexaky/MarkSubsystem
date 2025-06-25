@@ -268,6 +268,124 @@ public class EvaluationController : ControllerBase
                     .OrderBy(g => g.Sequence)
                     .ToList();
 
+                // Дополнительные проверки последовательности шагов
+                var userSteps = validSequences.Select(s => s.Sequence).OrderBy(s => s).ToList();
+                var programSteps = trueProgramSequences.Select(s => s.Sequence).OrderBy(s => s).ToList();
+                await LogDebug($"User steps: [{string.Join(", ", userSteps)}]");
+                await LogDebug($"Program steps: [{string.Join(", ", programSteps)}]");
+                
+                // Проверка неправильной последовательности
+                bool sequenceError = false;
+                int firstMismatchIndex = -1;
+                for (int i = 0; i < Math.Min(userSteps.Count, programSteps.Count); i++)
+                {
+                    if (userSteps[i] != programSteps[i])
+                    {
+                        sequenceError = true;
+                        firstMismatchIndex = i;
+                        await LogDebug($"Sequence mismatch detected at index {i}: user step {userSteps[i]} vs program step {programSteps[i]}");
+                        break;
+                    }
+                }
+                
+                // Если обнаружена неправильная последовательность, добавляем ошибки за все последующие шаги программы
+                if (sequenceError && firstMismatchIndex >= 0)
+                {
+                    for (int i = firstMismatchIndex; i < programSteps.Count; i++)
+                    {
+                        var programSequence = trueProgramSequences.FirstOrDefault(ps => ps.Sequence == programSteps[i]);
+                        if (programSequence != null)
+                        {
+                            int sequenceElementsCount = 0;
+                            foreach (var programVar in programSequence.Variables)
+                            {
+                                int elementCount = CountElements(programVar.Value, programVar.Type, programVar.Rank);
+                                sequenceElementsCount += elementCount;
+                            }
+                            mistakes += sequenceElementsCount;
+                            await LogDebug($">>> ADDING {sequenceElementsCount} MISTAKES for sequence error at program step {programSteps[i]}");
+                        }
+                    }
+                }
+                
+                // Проверка неправильного номера шага
+                for (int i = 0; i < userSteps.Count; i++)
+                {
+                    bool stepMismatch = false;
+                    
+                    // Проверяем, есть ли пользовательский шаг в программе на правильной позиции
+                    if (i < programSteps.Count && userSteps[i] != programSteps[i])
+                    {
+                        stepMismatch = true;
+                    }
+                    // Проверяем, есть ли пользовательский шаг в программе вообще
+                    else if (i >= programSteps.Count || !programSteps.Contains(userSteps[i]))
+                    {
+                        stepMismatch = true;
+                    }
+                    
+                    if (stepMismatch)
+                    {
+                        // Добавляем элементы всех переменных из этого и последующих шагов программы
+                        for (int j = i; j < programSteps.Count; j++)
+                        {
+                            var programSequence = trueProgramSequences.FirstOrDefault(ps => ps.Sequence == programSteps[j]);
+                            if (programSequence != null)
+                            {
+                                int sequenceElementsCount = 0;
+                                foreach (var programVar in programSequence.Variables)
+                                {
+                                    int elementCount = CountElements(programVar.Value, programVar.Type, programVar.Rank);
+                                    sequenceElementsCount += elementCount;
+                                }
+                                mistakes += sequenceElementsCount;
+                                await LogDebug($">>> ADDING {sequenceElementsCount} MISTAKES for wrong step number at program step {programSteps[j]}");
+                            }
+                        }
+                        break; // Выходим после первого несоответствия
+                    }
+                }
+                
+                // Проверка недорешенной задачи
+                if (userSteps.Count < programSteps.Count)
+                {
+                    for (int i = userSteps.Count; i < programSteps.Count; i++)
+                    {
+                        var programSequence = trueProgramSequences.FirstOrDefault(ps => ps.Sequence == programSteps[i]);
+                        if (programSequence != null)
+                        {
+                            int sequenceElementsCount = 0;
+                            foreach (var programVar in programSequence.Variables)
+                            {
+                                int elementCount = CountElements(programVar.Value, programVar.Type, programVar.Rank);
+                                sequenceElementsCount += elementCount;
+                            }
+                            mistakes += sequenceElementsCount;
+                            await LogDebug($">>> ADDING {sequenceElementsCount} MISTAKES for unsolved step {programSteps[i]}");
+                        }
+                    }
+                }
+                
+                // Проверка лишних шагов пользователя
+                if (userSteps.Count > programSteps.Count)
+                {
+                    for (int i = programSteps.Count; i < userSteps.Count; i++)
+                    {
+                        var userSequence = validSequences.FirstOrDefault(us => us.Sequence == userSteps[i]);
+                        if (userSequence.Variables != null)
+                        {
+                            int sequenceElementsCount = 0;
+                            foreach (var userVar in userSequence.Variables)
+                            {
+                                int elementCount = CountElements(userVar.VariableValue, "Unknown", 0);
+                                sequenceElementsCount += elementCount;
+                            }
+                            mistakes += sequenceElementsCount;
+                            await LogDebug($">>> ADDING {sequenceElementsCount} MISTAKES for extra user step {userSteps[i]}");
+                        }
+                    }
+                }
+
                 // Проверяем шаги и переменные, собирая все ошибки
                 foreach (var (sequence, variables) in validSequences)
                 {
@@ -281,7 +399,16 @@ public class EvaluationController : ControllerBase
                     if (trueProgramSequence == null)
                     {
                         isCorrect = false;
-                        mistakes++;
+                        // Считаем все элементы пользовательских переменных как ошибки
+                        int stepElementsCount = 0;
+                        foreach (var userVar in variables)
+                        {
+                            int elementCount = CountElements(userVar.VariableValue, "Unknown", 0);
+                            stepElementsCount += elementCount;
+                        }
+                        mistakes += stepElementsCount;
+                        await LogDebug($">>> ADDING {stepElementsCount} MISTAKES for missing step {userStep} at sequence {sequence}");
+                        
                         if (request.Type == 0)
                         {
                             response.Errors.Add(new ErrorDto
@@ -311,7 +438,16 @@ public class EvaluationController : ControllerBase
                         if (stepMismatch)
                         {
                             isCorrect = false;
-                            mistakes++;
+                            // Считаем все элементы переменных как ошибки при несоответствии переменных
+                            int stepElementsCount = 0;
+                            foreach (var userVar in variables)
+                            {
+                                int elementCount = CountElements(userVar.VariableValue, "Unknown", 0);
+                                stepElementsCount += elementCount;
+                            }
+                            mistakes += stepElementsCount;
+                            await LogDebug($">>> ADDING {stepElementsCount} MISTAKES for step variable mismatch at sequence {sequence}");
+                            
                             if (request.Type == 0)
                             {
                                 response.Errors.Add(new ErrorDto
@@ -340,7 +476,9 @@ public class EvaluationController : ControllerBase
                         if (substituteVar == null)
                         {
                             isCorrect = false;
-                            mistakes++;
+                            mistakes += elementCount; // Считаем все элементы переменной как ошибки
+                            await LogDebug($">>> ADDING {elementCount} MISTAKES for missing substitute value for {userVar.VariableName}");
+                            
                             if (request.Type == 0)
                             {
                                 response.Errors.Add(new ErrorDto
@@ -370,7 +508,10 @@ public class EvaluationController : ControllerBase
                         if (matches < total)
                         {
                             isCorrect = false;
-                            mistakes += (int)(total - matches);
+                            int elementMistakes = (int)(total - matches);
+                            mistakes += elementMistakes;
+                            await LogDebug($">>> ADDING {elementMistakes} MISTAKES for variable {userVar.VariableName} (matches: {matches}, total: {total})");
+                            
                             if (request.Type == 0)
                             {
                                 response.Errors.Add(new ErrorDto
@@ -379,10 +520,10 @@ public class EvaluationController : ControllerBase
                                     Sequence = sequence,
                                     Step = userStep,
                                     VariableName = userVar.VariableName,
-                                    Message = $"Incorrect value for {userVar.VariableName}: expected {substituteValue}, got {userValue}, mismatches={total - matches}"
+                                    Message = $"Incorrect value for {userVar.VariableName}: expected {substituteValue}, got {userValue}, mismatches={elementMistakes}"
                                 });
                             }
-                            await LogDebug($"Mismatch: sequence={sequence}, algoStep={userStep}, userVar={userVar.VariableName}, expected={substituteValue}, got={userValue}, userBytes={userBytes}, substituteBytes={substituteBytes}, mismatches={total - matches}");
+                            await LogDebug($"Mismatch: sequence={sequence}, algoStep={userStep}, userVar={userVar.VariableName}, expected={substituteValue}, got={userValue}, userBytes={userBytes}, substituteBytes={substituteBytes}, mismatches={elementMistakes}");
                         }
                         else
                         {
@@ -395,7 +536,10 @@ public class EvaluationController : ControllerBase
                     if (expectedAlgoVar == null)
                     {
                         isCorrect = false;
-                        mistakes++;
+                        // Для неверного номера шага добавляем 1 ошибку
+                        mistakes += 1;
+                        await LogDebug($">>> ADDING 1 MISTAKE for wrong AlgoStep at sequence {sequence}, step {userStep}");
+                        
                         if (request.Type == 0)
                         {
                             response.Errors.Add(new ErrorDto
@@ -445,7 +589,15 @@ public class EvaluationController : ControllerBase
                                     Message = $"Пользователь имеет лишний шаг sequence={sequence}"
                                 });
                             }
-                            mistakes++;
+                            // Для лишнего шага считаем все элементы переменных как ошибки
+                            int stepElementsCount = 0;
+                            foreach (var userVar in userSequence.Variables)
+                            {
+                                int elementCount = CountElements(userVar.VariableValue, "Unknown", 0);
+                                stepElementsCount += elementCount;
+                            }
+                            mistakes += stepElementsCount;
+                            await LogDebug($">>> ADDING {stepElementsCount} MISTAKES for excess step at sequence {sequence}");
                             await LogDebug($"User has excess step at sequence={sequence}");
                         }
                     }
@@ -463,6 +615,7 @@ public class EvaluationController : ControllerBase
                             int elementCount = CountElements(programVar.Value, programVar.Type, programVar.Rank);
                             totalElementsInSequence += elementCount;
                             mistakes += elementCount;
+                            await LogDebug($">>> ADDING {elementCount} MISTAKES for missing sequence {step}, variable {programVar.VariableName}");
                             await LogDebug($"Missing sequence={step}, variable={programVar.VariableName}, elements={elementCount}");
                         }
 
@@ -503,7 +656,19 @@ public class EvaluationController : ControllerBase
                                      ((float)programStepsCount / userStepsCount);
                     testScore = Math.Max(0f, Math.Min(100f, rawScore));
                     testScores.Add(testScore);
-                    await LogDebug($"Test score for testId={testId}: mistakes={mistakes}, userAllVariablesCount={userAllVariablesCount}, userSteps={userStepsCount}, programSteps={programStepsCount}, score={testScore}");
+                    
+                    // Подробное логирование для отладки
+                    await LogDebug($"=== SCORE CALCULATION FOR TEST {testId} ===");
+                    await LogDebug($"Mistakes: {mistakes}");
+                    await LogDebug($"User all variables count: {userAllVariablesCount}");
+                    await LogDebug($"User steps count: {userStepsCount}");
+                    await LogDebug($"Program steps count: {programStepsCount}");
+                    await LogDebug($"Error rate: {(float)mistakes / userAllVariablesCount:F4}");
+                    await LogDebug($"Accuracy: {1f - (float)mistakes / userAllVariablesCount:F4}");
+                    await LogDebug($"Step ratio: {(float)programStepsCount / userStepsCount:F4}");
+                    await LogDebug($"Raw score: {rawScore:F2}");
+                    await LogDebug($"Final score: {testScore:F2}");
+                    await LogDebug($"=== END SCORE CALCULATION ===");
                 }
 
                 if (request.Type == 1)
