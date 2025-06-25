@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using MarkSubsystem.DTO;
 using System.IO;
+using Microsoft.EntityFrameworkCore.Metadata.Internal;
 
 namespace MarkSubsystem.Controllers;
 
@@ -542,99 +543,143 @@ public class EvaluationController : ControllerBase
                     }
                 }
 
-                var existingUserSolution = await _context.SolutionsByUsers
-                    .Where(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId)
-                    .ToListAsync();
-                if (existingUserSolution.Any())
+                // Handle user and program solutions within a transaction
+                using var transaction = await _context.Database.BeginTransactionAsync();
+                try
                 {
-                    await LogDebug($"Removing existing user solution for sessionId={sessionId}, userId={userId}, testId={testId}");
-                    var existingUserVariables = await _context.VariablesSolutionsByUsers
-                        .Where(v => v.TestId == testId && existingUserSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
+                    // Delete existing user solutions
+                    var existingUserSolution = await _context.SolutionsByUsers
+                        .Where(s => s.SessionId == sessionId && s.UserId == userId && s.TestId == testId)
                         .ToListAsync();
-                    _context.VariablesSolutionsByUsers.RemoveRange(existingUserVariables);
-                    _context.SolutionsByUsers.RemoveRange(existingUserSolution);
-                    await _context.SaveChangesAsync();
-                    await LogDebug($"Removed {existingUserSolution.Count} user solutions and {existingUserVariables.Count} variables");
-                }
-
-                foreach (var (sequence, variables) in validSequences)
-                {
-                    var step = variables.First().Step;
-                    var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
-                    var userStep = new SolutionsByUser
+                    if (existingUserSolution.Any())
                     {
-                        SessionId = sessionId,
-                        UserId = userId,
-                        TestId = testId,
-                        UserStep = step,
-                        UserLineNumber = 1,
-                        OrderNumber = sequence,
-                        StepDifficult = stepDifficulty
-                    };
-                    _context.SolutionsByUsers.Add(userStep);
+                        await LogDebug($"Removing existing user solution for sessionId={sessionId}, userId={userId}, testId={testId}");
+                        var existingUserVariables = await _context.VariablesSolutionsByUsers
+                            .Where(v => v.TestId == testId && existingUserSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
+                            .ToListAsync();
+                        _context.VariablesSolutionsByUsers.RemoveRange(existingUserVariables);
+                        _context.SolutionsByUsers.RemoveRange(existingUserSolution);
+                        await _context.SaveChangesAsync();
+                        await LogDebug($"Removed {existingUserSolution.Count()} user solutions and {existingUserVariables.Count()} variables");
+                    }
 
-                    foreach (var variable in variables)
+                    // Add new user solutions
+                    foreach (var (sequence, variables) in validSequences)
                     {
-                        var userVariable = new VariablesSolutionsByUsers
+                        var step = variables.First().Step;
+                        var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
+                        var userStep = new SolutionsByUser
                         {
+                            SessionId = sessionId,
+                            UserId = userId,
+                            TestId = testId,
                             UserStep = step,
                             UserLineNumber = 1,
                             OrderNumber = sequence,
-                            TestId = testId,
-                            VarName = variable.VariableName,
-                            VarValue = variable.VariableValue
+                            StepDifficult = stepDifficulty
                         };
-                        _context.VariablesSolutionsByUsers.Add(userVariable);
-                    }
-                }
+                        _context.SolutionsByUsers.Add(userStep);
+                        var variableGroups = variables.GroupBy(v => v.VariableName).ToList(); //new
 
-                var existingProgramSolution = await _context.SolutionsByPrograms
-                    .Where(s => s.SessionId == sessionId && s.TestId == testId)
-                    .ToListAsync();
-                if (existingProgramSolution.Any())
-                {
-                    await LogDebug($"Removing existing program solution for sessionId={sessionId}, testId={testId}");
-                    var existingProgramVariables = await _context.VariablesSolutionsByPrograms
-                        .Where(v => v.TestId == testId && existingProgramSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
-                        .ToListAsync();
-                    _context.VariablesSolutionsByPrograms.RemoveRange(existingProgramVariables);
-                    _context.SolutionsByPrograms.RemoveRange(existingProgramSolution);
-                    await _context.SaveChangesAsync();
-                    await LogDebug($"Removed {existingProgramSolution.Count} program solutions and {existingProgramVariables.Count} variables");
-                }
-
-                foreach (var sequence in trueProgramSequences)
-                {
-                    var step = sequence.Sequence;
-                    var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
-                    var programStep = new SolutionsByProgram
-                    {
-                        SessionId = sessionId,
-                        TestId = testId,
-                        ProgramStep = step,
-                        ProgramLineNumber = 1,
-                        OrderNumber = step,
-                        StepDifficult = stepDifficulty
-                    };
-                    _context.SolutionsByPrograms.Add(programStep);
-
-                    foreach (var variable in sequence.Variables)
-                    {
-                        var programVariable = new VariablesSolutionsByProgram
+                        //foreach (var variable in variables)
+                        foreach (var variableGroup in variableGroups) //new
                         {
+                            var variable = variableGroup.Last(); //new
+                            var userVariable = new VariablesSolutionsByUsers
+                            {
+                                UserStep = step,
+                                UserLineNumber = 1,
+                                OrderNumber = sequence,
+                                TestId = testId,
+                                VarName = variable.VariableName,
+                                VarValue = variable.VariableValue
+                            };
+                            _context.VariablesSolutionsByUsers.Add(userVariable);
+                        }
+                    }
+
+                    // Check for duplicate variables in trueProgramSequences
+                    var duplicateProgramVariables = trueProgramSequences
+                        .SelectMany(s => s.Variables, (s, v) => new { s.Sequence, v.VariableName })
+                        .GroupBy(x => new { x.Sequence, x.VariableName })
+                        .Where(g => g.Count() > 1)
+                        .ToList();
+
+                    if (duplicateProgramVariables.Any())
+                    {
+                        var errorMessage = $"Duplicate variables detected in trueProgramSequences for testId={testId}: {JsonSerializer.Serialize(duplicateProgramVariables)}";
+                        await LogError(errorMessage);
+                        response.Errors.Add(new ErrorDto { TestId = testId, Message = errorMessage });
+                        await transaction.RollbackAsync();
+                        continue;
+                    }
+
+                    // Delete existing program solutions
+                    var existingProgramSolution = await _context.SolutionsByPrograms
+                        .Where(s => s.SessionId == sessionId && s.TestId == testId)
+                        .ToListAsync();
+                    if (existingProgramSolution.Any())
+                    {
+                        await LogDebug($"Removing existing program solution for sessionId={sessionId}, testId={testId}");
+                        var existingProgramVariables = await _context.VariablesSolutionsByPrograms
+                            .Where(v => v.TestId == testId && existingProgramSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
+                            .ToListAsync();
+                        _context.VariablesSolutionsByPrograms.RemoveRange(existingProgramVariables);
+                        _context.SolutionsByPrograms.RemoveRange(existingProgramSolution);
+                        await _context.SaveChangesAsync();
+                        await LogDebug($"Removed {existingProgramSolution.Count()} program solutions and {existingProgramVariables.Count()} variables");
+                    }
+
+                    // Add new program solutions
+                    foreach (var sequence in trueProgramSequences)
+                    {
+                        var step = sequence.Sequence;
+                        var stepDifficulty = stepDifficulties.GetValueOrDefault(step, 0.5f);
+                        var programStep = new SolutionsByProgram
+                        {
+                            SessionId = sessionId,
+                            TestId = testId,
                             ProgramStep = step,
                             ProgramLineNumber = 1,
                             OrderNumber = step,
-                            TestId = testId,
-                            VarName = variable.VariableName,
-                            VarValue = variable.Value
+                            StepDifficult = stepDifficulty
                         };
-                        _context.VariablesSolutionsByPrograms.Add(programVariable);
+                        _context.SolutionsByPrograms.Add(programStep);
+
+                        //foreach (var variable in sequence.Variables)
+                        var variableGroups = sequence.Variables.GroupBy(v => v.VariableName).ToList(); //new
+                        foreach (var variableGroup in variableGroups) //new
+                        {
+                            var variable = variableGroup.Last(); //new
+                            var programVariable = new VariablesSolutionsByProgram
+                            {
+                                ProgramStep = step,
+                                ProgramLineNumber = 1,
+                                OrderNumber = step,
+                                TestId = testId,
+                                VarName = variable.VariableName,
+                                VarValue = variable.Value
+                            };
+                            _context.VariablesSolutionsByPrograms.Add(programVariable);
+                        }
                     }
+
+                    await _context.SaveChangesAsync();
+                    await transaction.CommitAsync();
+                    await LogDebug($"Saved solutions for testId={testId}, userId={userId}, sessionId={sessionId}");
+                }
+                catch (Exception ex)
+                {
+                    await transaction.RollbackAsync();
+                    await LogError($"Exception in saving solutions: {ex.Message}, InnerException: {ex.InnerException?.Message}");
+                    response.Errors.Add(new ErrorDto
+                    {
+                        TestId = testId,
+                        Message = $"Failed to save solutions: {ex.Message}, InnerException: {ex.InnerException?.Message}"
+                    });
+                    continue; // Continue to the next test to avoid breaking the entire loop
                 }
 
-                await _context.SaveChangesAsync();
-                await LogDebug($"Saved solutions for testId={testId}, userId={userId}, sessionId={sessionId}");
 
                 var updateStepResponse = new UpdateStepResponseDto
                 {
