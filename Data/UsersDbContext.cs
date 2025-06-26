@@ -200,7 +200,7 @@ public class UsersDbContext : DbContext
 
         // Настройка VariablesSolutionsByUsers
         modelBuilder.Entity<VariablesSolutionsByUsers>()
-            .HasKey(v => new { v.UserStep, v.UserLineNumber, v.OrderNumber, v.TestId, v.VarName });
+            .HasKey(v => new { v.UserStep, v.UserLineNumber, v.OrderNumber, v.TestId, v.VarName, v.UserId });
 
         // Настройка SolutionsByProgram
         modelBuilder.Entity<SolutionsByProgram>()

@@ -154,6 +154,8 @@ public class EvaluationController : ControllerBase
 
                 await LogDebug($"User sequences for testId={testId}: {string.Join(",", sequences.Select(s => s.Sequence))}");
 
+                var stepToLineNumberMap = new Dictionary<int, int>();
+
                 var validSequences = new List<(int Sequence, List<VariableSubmissionDto> Variables)>();
                 foreach (var sequence in sequences)
                 {
@@ -176,6 +178,10 @@ public class EvaluationController : ControllerBase
                         continue;
                     }
                     validSequences.Add((sequence.Sequence, sequence.Variables));
+                    if (!stepToLineNumberMap.ContainsKey(step))
+                    {
+                        stepToLineNumberMap[step] = algoVar.LineNumber;
+                    }
                 }
 
                 var fileContent = new StringBuilder();
@@ -559,14 +565,26 @@ public class EvaluationController : ControllerBase
                         IsCorrect = isCorrect
                     });
 
-                    testStepResponses.Add(new TestStepResponse
+                    // Находим или создаем запись для данного шага
+                    var existingStepResponse = testStepResponses.FirstOrDefault(tsr => 
+                        tsr.TestId == testId && tsr.AlgoId == testData.AlgoId && tsr.AlgoStep == userStep);
+                    
+                    if (existingStepResponse == null)
                     {
-                        TestId = testId,
-                        AlgoId = testData.AlgoId,
-                        AlgoStep = userStep,
-                        CorrectCount = isCorrect ? 1 : 0,
-                        IncorrectCount = isCorrect ? 0 : 1
-                    });
+                        testStepResponses.Add(new TestStepResponse
+                        {
+                            TestId = testId,
+                            AlgoId = testData.AlgoId,
+                            AlgoStep = userStep,
+                            CorrectCount = isCorrect ? 1 : 0,
+                            IncorrectCount = isCorrect ? 0 : 1
+                        });
+                    }
+                    else
+                    {
+                        existingStepResponse.CorrectCount += isCorrect ? 1 : 0;
+                        existingStepResponse.IncorrectCount += isCorrect ? 0 : 1;
+                    }
 
                     await LogDebug($"Sequence={sequence}, algoStep={userStep}, isCorrect={isCorrect}, correctElements={correctElementsInSequence}, totalElements={totalElementsInSequence}");
                 }
@@ -621,7 +639,7 @@ public class EvaluationController : ControllerBase
 
                         stepResults.Add(new StepResultDto
                         {
-                            Step = 0,
+                            Step = step,
                             IsCorrect = false
                         });
 
@@ -629,7 +647,7 @@ public class EvaluationController : ControllerBase
                         {
                             TestId = testId,
                             AlgoId = testData.AlgoId,
-                            AlgoStep = 0,
+                            AlgoStep = step,
                             CorrectCount = 0,
                             IncorrectCount = 1
                         });
@@ -757,7 +775,8 @@ public class EvaluationController : ControllerBase
                                 OrderNumber = sequence,
                                 TestId = testId,
                                 VarName = variable.VariableName,
-                                VarValue = variable.VariableValue
+                                VarValue = variable.VariableValue,
+                                UserId = userId
                             };
                             _context.VariablesSolutionsByUsers.Add(userVariable);
                         }

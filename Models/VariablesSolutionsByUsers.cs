@@ -8,7 +8,7 @@
         public int TestId { get; set; } // Идентификатор теста
         public string VarName { get; set; } // Имя переменной
         public string VarValue { get; set; } // Значение переменной
-
+        public int UserId { get; set; }
         // Составной первичный ключ будет настроен в DbContext
     }
 }

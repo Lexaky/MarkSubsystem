@@ -3,6 +3,7 @@ using System;
 using MarkSubsystem.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace MarkSubsystem.Migrations.Users
 {
     [DbContext(typeof(UsersDbContext))]
-    partial class UsersDbContextModelSnapshot : ModelSnapshot
+    [Migration("20250626031340_FixedVarSolution")]
+    partial class FixedVarSolution
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -298,7 +301,7 @@ namespace MarkSubsystem.Migrations.Users
                         .IsRequired()
                         .HasColumnType("text");
 
-                    b.HasKey("UserStep", "UserLineNumber", "OrderNumber", "TestId", "VarName", "UserId");
+                    b.HasKey("UserStep", "UserLineNumber", "OrderNumber", "TestId", "VarName");
 
                     b.ToTable("VariablesSolutionsByUsers");
                 });
