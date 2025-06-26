@@ -738,7 +738,7 @@ public class EvaluationController : ControllerBase
                     {
                         await LogDebug($"Removing existing user solution for sessionId={sessionId}, userId={userId}, testId={testId}");
                         var existingUserVariables = await _context.VariablesSolutionsByUsers
-                            .Where(v => v.TestId == testId && existingUserSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
+                            .Where(v => v.TestId == testId && v.UserId == userId && existingUserSolution.Select(s => s.OrderNumber).Contains(v.OrderNumber))
                             .ToListAsync();
                         _context.VariablesSolutionsByUsers.RemoveRange(existingUserVariables);
                         _context.SolutionsByUsers.RemoveRange(existingUserSolution);
