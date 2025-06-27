@@ -110,6 +110,13 @@ public class EvaluationController : ControllerBase
                     continue;
                 }
                 await LogDebug($"Algo variables: {JsonSerializer.Serialize(algoVariables)}");
+                var uniqueAlgoVariables = algoVariables
+    .GroupBy(av => new { av.Step, av.LineNumber })
+    .Select(g => g.First())
+    .ToList();
+
+                var stepToLineNumberMap = uniqueAlgoVariables.ToDictionary(av => av.Step, av => av.LineNumber);
+                var lineNumberToStepMap = uniqueAlgoVariables.ToDictionary(av => av.LineNumber, av => av.Step);
 
                 await LogDebug($"Fetching algo steps for algoId={testData.AlgoId}");
                 var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{testData.AlgoId}");
@@ -154,7 +161,6 @@ public class EvaluationController : ControllerBase
 
                 await LogDebug($"User sequences for testId={testId}: {string.Join(",", sequences.Select(s => s.Sequence))}");
 
-                var stepToLineNumberMap = new Dictionary<int, int>();
 
                 var validSequences = new List<(int Sequence, List<VariableSubmissionDto> Variables)>();
                 foreach (var sequence in sequences)
@@ -639,7 +645,7 @@ public class EvaluationController : ControllerBase
 
                         stepResults.Add(new StepResultDto
                         {
-                            Step = step,
+                            Step = lineNumberToStepMap[programVars.ElementAt(step).TrackerHitId],
                             IsCorrect = false
                         });
 
@@ -647,7 +653,7 @@ public class EvaluationController : ControllerBase
                         {
                             TestId = testId,
                             AlgoId = testData.AlgoId,
-                            AlgoStep = step,
+                            AlgoStep = lineNumberToStepMap[programVars.ElementAt(step).TrackerHitId],
                             CorrectCount = 0,
                             IncorrectCount = 1
                         });
