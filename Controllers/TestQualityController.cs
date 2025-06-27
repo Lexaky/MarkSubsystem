@@ -82,10 +82,13 @@ public class TestQualityController : ControllerBase
                 return Ok();
             }
 
+            var sessionTestIds = new Dictionary<int, List<int>>();
+
             foreach (var update in updates)
             {
                 await LogDebug($"Updating quality parameters for testId={update.TestId}, algoId={update.AlgoId}");
 
+                // Получение теста
                 var testResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-test/{update.TestId}");
                 if (!testResponse.IsSuccessStatusCode)
                 {
@@ -100,9 +103,41 @@ public class TestQualityController : ControllerBase
                     continue;
                 }
 
+                // Получение всех шагов алгоритма
+                var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{update.AlgoId}");
+                if (!algoStepsResponse.IsSuccessStatusCode)
+                {
+                    await LogError($"Failed to fetch algo steps: algoId={update.AlgoId}, status={algoStepsResponse.StatusCode}");
+                    continue;
+                }
+                
+                var algoStepsContent = await algoStepsResponse.Content.ReadAsStringAsync();
+                await LogDebug($"Fetched algo steps for algoId={update.AlgoId}: {algoStepsContent}");
+                List<AlgoStep> algoSteps;
+                try
+                {
+                    var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                    algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent, options) ?? new List<AlgoStep>();
+                    if (!algoSteps.Any())
+                    {
+                        await LogError($"Deserialized algo steps is empty for algoId={update.AlgoId}");
+                        continue;
+                    }
+                    foreach (var algoStep in algoSteps)
+                    {
+                        await LogDebug($"AlgoStep: algoId={algoStep.AlgoId}, step={algoStep.Step}, difficult={algoStep.Difficult}");
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    await LogError($"Failed to deserialize algo steps for algoId={update.AlgoId}: {ex.Message}");
+                    continue;
+                }
+
+                // Получение всех ответов шагов для теста
                 var stepResponsesResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-step-responses/{update.TestId}");
                 var stepResponsesContent = await stepResponsesResponse.Content.ReadAsStringAsync();
-                await LogDebug($"Fetched step responses for testId={test.TestId}: {stepResponsesContent}");
+                await LogDebug($"Fetched step responses for testId={update.TestId}: {stepResponsesContent}");
                 List<TestStepResponse> testStepResponses;
                 try
                 {
@@ -114,35 +149,35 @@ public class TestQualityController : ControllerBase
                     testStepResponses = new List<TestStepResponse>();
                 }
 
-                var algoStepsResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-algo-steps/{update.AlgoId}");
-                if (!algoStepsResponse.IsSuccessStatusCode)
+                // Инициализация TestStepResponses для всех шагов из AlgoSteps
+                foreach (var algoStep in algoSteps)
                 {
-                    await LogError($"Failed to fetch algo steps: algoId={update.AlgoId}, status={algoStepsResponse.StatusCode}");
-                    continue;
+                    if (!testStepResponses.Any(s => s.AlgoStep == algoStep.Step))
+                    {
+                        var newStepResponse = new TestStepResponse
+                        {
+                            TestId = update.TestId,
+                            AlgoId = update.AlgoId,
+                            AlgoStep = algoStep.Step,
+                            CorrectCount = 0,
+                            IncorrectCount = 0
+                        };
+                        testStepResponses.Add(newStepResponse);
+                        await LogDebug($"Initialized step response: testId={update.TestId}, algoStep={algoStep.Step}, correct=0, incorrect=0");
+                    }
                 }
 
-                var algoStepsContent = await algoStepsResponse.Content.ReadAsStringAsync();
-                List<AlgoStep> algoSteps;
-                try
-                {
-                    algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
-                }
-                catch (JsonException ex)
-                {
-                    await LogError($"Failed to deserialize algo steps for algoId={update.AlgoId}: {ex.Message}");
-                    algoSteps = new List<AlgoStep>();
-                }
-
-                if (!algoSteps.Any())
-                {
-                    await LogError($"No algo steps found for algoId={update.AlgoId}");
-                    continue;
-                }
-
-                var normalizedStepDifficulties = new List<float>();
-
+                // Обновление TestStepResponses из StepResults
+                await LogDebug($"Processing {update.StepResults.Count} StepResults for testId={update.TestId}");
                 foreach (var stepResult in update.StepResults)
                 {
+                    var matchingStep = algoSteps.FirstOrDefault(a => a.Step == stepResult.Step);
+                    if (matchingStep == null)
+                    {
+                        await LogWarning($"Invalid step in StepResults: testId={update.TestId}, step={stepResult.Step}, not found in AlgoSteps for algoId={update.AlgoId}. Available steps: {string.Join(", ", algoSteps.Select(a => a.Step))}");
+                        continue;
+                    }
+
                     var stepResponse = testStepResponses.FirstOrDefault(s => s.TestId == update.TestId && s.AlgoStep == stepResult.Step);
                     if (stepResponse == null)
                     {
@@ -155,69 +190,76 @@ public class TestQualityController : ControllerBase
                             IncorrectCount = stepResult.IsCorrect ? 0 : 1
                         };
                         testStepResponses.Add(stepResponse);
+                        await LogDebug($"Added new step response: testId={update.TestId}, algoStep={stepResult.Step}, correct={stepResponse.CorrectCount}, incorrect={stepResponse.IncorrectCount}");
                     }
                     else
                     {
                         stepResponse.CorrectCount += stepResult.IsCorrect ? 1 : 0;
                         stepResponse.IncorrectCount += stepResult.IsCorrect ? 0 : 1;
-                    }
-
-                    float stepDifficulty = 0f;
-                    if (stepResponse.CorrectCount > 0)
-                    {
-                        stepDifficulty = stepResponse.IncorrectCount == 0
-                            ? (float)Math.Log(stepResponse.CorrectCount)
-                            : (float)Math.Max(Math.Log((float)(stepResponse.CorrectCount / stepResponse.IncorrectCount)), 0);
-                    }
-                    float normalizedStepDifficulty = (float)Math.Log10(stepDifficulty + 1) / 10f;
-                    normalizedStepDifficulties.Add(normalizedStepDifficulty);
-
-                    var algoStepContent = new StringContent(
-                        JsonSerializer.Serialize(new
-                        {
-                            AlgoId = update.AlgoId,
-                            Step = stepResult.Step,
-                            Difficult = Math.Min(Math.Max(normalizedStepDifficulty, 0f), 1f)
-                        }), Encoding.UTF8, "application/json");
-
-                    var algoStepResponse = await _httpClient.PutAsync($"{_testManagementUrl}/modify-algo-step/{update.AlgoId}/{stepResult.Step}", algoStepContent);
-                    if (!algoStepResponse.IsSuccessStatusCode)
-                    {
-                        var errorContent = await algoStepResponse.Content.ReadAsStringAsync();
-                        await LogError($"Failed to update algo step: algoId={update.AlgoId}, step={stepResult.Step}, status={algoStepResponse.StatusCode}, response={errorContent}");
-                    }
-                    else
-                    {
-                        await LogDebug($"Updated algo step: algoId={update.AlgoId}, step={stepResult.Step}, difficulty={normalizedStepDifficulty}");
+                        await LogDebug($"Updated step response: testId={update.TestId}, algoStep={stepResult.Step}, correct={stepResponse.CorrectCount}, incorrect={stepResponse.IncorrectCount}");
                     }
                 }
 
-                if (!update.StepResults.Any())
-                {
-                    await LogDebug($"No step results provided for testId={update.TestId}, skipping further updates.");
-                    continue;
-                }
-
+                // Сохранение TestStepResponses
                 var stepResponsesContentStatus = new StringContent(JsonSerializer.Serialize(testStepResponses), Encoding.UTF8, "application/json");
-                var stepResponses = await _httpClient.PutAsync($"{_testManagementUrl}/modify-step-responses/{update.TestId}", stepResponsesContentStatus);
-                if (!stepResponses.IsSuccessStatusCode)
+                var stepResponsesUpdate = await _httpClient.PutAsync($"{_testManagementUrl}/modify-step-responses/{update.TestId}", stepResponsesContentStatus);
+                if (!stepResponsesUpdate.IsSuccessStatusCode)
                 {
-                    var errorContent = await stepResponses.Content.ReadAsStringAsync();
-                    await LogError($"Failed to update test step responses: testId={update.TestId}, status={stepResponses.StatusCode}, response={errorContent}");
+                    var errorContent = await stepResponsesUpdate.Content.ReadAsStringAsync();
+                    await LogError($"Failed to update test step responses: testId={update.TestId}, status={stepResponsesUpdate.StatusCode}, response={errorContent}");
                     continue;
+                }
+                await LogDebug($"Updated test step responses for testId={update.TestId}");
+
+                // Повторная загрузка TestStepResponses для получения полных данных
+                var allStepResponsesForTest = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-step-responses/{update.TestId}");
+                if (!allStepResponsesForTest.IsSuccessStatusCode)
+                {
+                    var errorContent = await allStepResponsesForTest.Content.ReadAsStringAsync();
+                    await LogError($"Failed to fetch all step responses for testId={update.TestId}, status={allStepResponsesForTest.StatusCode}, response={errorContent}");
+                    continue;
+                }
+
+                var allStepResponsesContent = await allStepResponsesForTest.Content.ReadAsStringAsync();
+                List<TestStepResponse> allTestStepResponsesForTest;
+                try
+                {
+                    allTestStepResponsesForTest = JsonSerializer.Deserialize<List<TestStepResponse>>(allStepResponsesContent) ?? new List<TestStepResponse>();
+                    await LogDebug($"Fetched all step responses for testId={update.TestId}: {allStepResponsesContent}");
+                }
+                catch (JsonException ex)
+                {
+                    await LogError($"Failed to deserialize all step responses for testId={update.TestId}: {ex.Message}");
+                    allTestStepResponsesForTest = new List<TestStepResponse>();
+                }
+
+                // Расчёт сложности тестового задания
+                int totalCorrectCount = allTestStepResponsesForTest.Sum(s => s.CorrectCount);
+                int totalIncorrectCount = allTestStepResponsesForTest.Sum(s => s.IncorrectCount);
+                int totalCount = totalCorrectCount + totalIncorrectCount;
+                float testDifficulty;
+
+                if (totalCount == 0)
+                {
+                    testDifficulty = totalCorrectCount > 0 ? (float)Math.Log(totalCorrectCount) : 0f;
+                    await LogDebug($"Test difficulty calculation for testId={update.TestId}: totalCount=0, CorrectCount={totalCorrectCount}, testDifficulty={testDifficulty}");
                 }
                 else
                 {
-                    await LogDebug($"Updated test step responses for testId={update.TestId}");
+                    testDifficulty = (float)Math.Log((float)totalCorrectCount / totalCount);
+                    await LogDebug($"Test difficulty calculation for testId={update.TestId}: CorrectCount={totalCorrectCount}, totalCount={totalCount}, testDifficulty={testDifficulty}");
                 }
 
-                float testDifficulty = normalizedStepDifficulties.Any() ? normalizedStepDifficulties.Average() : test.Difficult;
-                float normalizedTestDifficulty = Math.Min(Math.Max(testDifficulty, 0f), 1f);
+                float normalizedTestDifficulty = Math.Min(Math.Max(testDifficulty, 0f), 0.95f);
+                await LogDebug($"Normalized test difficulty for testId={update.TestId}: {normalizedTestDifficulty}");
+
+                float finalTestDifficulty = (normalizedTestDifficulty + test.Difficult) / 2f;
+                await LogDebug($"Final test difficulty for testId={update.TestId}: current={test.Difficult}, new={normalizedTestDifficulty}, final={finalTestDifficulty}");
 
                 var testContent = new StringContent(JsonSerializer.Serialize(new
                 {
                     TestId = update.TestId,
-                    difficult = normalizedTestDifficulty
+                    difficult = finalTestDifficulty
                 }), Encoding.UTF8, "application/json");
 
                 var testResponseStatus = await _httpClient.PutAsync($"{_testManagementUrl}/modify-test/{update.TestId}", testContent);
@@ -227,9 +269,144 @@ public class TestQualityController : ControllerBase
                     await LogError($"Failed to update test difficulty: testId={update.TestId}, status={testResponseStatus.StatusCode}, response={errorContent}");
                     continue;
                 }
-                else
+                await LogDebug($"Updated test difficulty for testId={update.TestId}: {finalTestDifficulty}");
+
+                // Расчёт сложности шагов алгоритма
+                var stepDifficulties = new Dictionary<int, float>();
+                foreach (var algoStep in algoSteps)
                 {
-                    await LogDebug($"Updated test difficulty for testId={update.TestId}: {normalizedTestDifficulty}");
+                    var stepResponsesForAlgoStep = allTestStepResponsesForTest
+                        .Where(s => s.AlgoId == update.AlgoId && s.AlgoStep == algoStep.Step)
+                        .ToList();
+                    int stepCorrectCount = stepResponsesForAlgoStep.Sum(s => s.CorrectCount);
+                    int stepIncorrectCount = stepResponsesForAlgoStep.Sum(s => s.IncorrectCount);
+
+                    await LogDebug($"Calculating difficulty for algoId={update.AlgoId}, step={algoStep.Step}: CorrectCount={stepCorrectCount}, IncorrectCount={stepIncorrectCount}");
+
+                    float stepDifficulty;
+                    if (stepCorrectCount == 0 && stepIncorrectCount == 0)
+                    {
+                        stepDifficulty = algoStep.Difficult != 0 ? algoStep.Difficult : 0f;
+                        await LogDebug($"Step difficulty calculation for algoId={update.AlgoId}, step={algoStep.Step}: No data (CorrectCount=0, IncorrectCount=0), using existing difficulty={stepDifficulty}");
+                    }
+                    else if (stepCorrectCount == 0)
+                    {
+                        stepDifficulty = 0f;
+                        await LogDebug($"Step difficulty calculation for algoId={update.AlgoId}, step={algoStep.Step}: CorrectCount=0, stepDifficulty=0");
+                    }
+                    else if (stepIncorrectCount > 0)
+                    {
+                        stepDifficulty = (float)Math.Log((float)stepCorrectCount / stepIncorrectCount);
+                        await LogDebug($"Step difficulty calculation for algoId={update.AlgoId}, step={algoStep.Step}: CorrectCount={stepCorrectCount}, IncorrectCount={stepIncorrectCount}, stepDifficulty={stepDifficulty}");
+                    }
+                    else
+                    {
+                        stepDifficulty = (float)Math.Log(stepCorrectCount);
+                        await LogDebug($"Step difficulty calculation for algoId={update.AlgoId}, step={algoStep.Step}: CorrectCount={stepCorrectCount}, IncorrectCount=0, stepDifficulty={stepDifficulty}");
+                    }
+
+                    float normalizedStepDifficulty = Math.Min(Math.Max(stepDifficulty, 0f), 1f);
+                    stepDifficulties[algoStep.Step] = normalizedStepDifficulty;
+
+                    var algoStepContent = new StringContent(
+                        JsonSerializer.Serialize(new
+                        {
+                            AlgoId = update.AlgoId,
+                            Step = algoStep.Step,
+                            Difficult = normalizedStepDifficulty
+                        }), Encoding.UTF8, "application/json");
+
+                    var algoStepResponse = await _httpClient.PutAsync($"{_testManagementUrl}/modify-algo-step/{update.AlgoId}/{algoStep.Step}", algoStepContent);
+                    if (!algoStepResponse.IsSuccessStatusCode)
+                    {
+                        var errorContent = await algoStepResponse.Content.ReadAsStringAsync();
+                        await LogError($"Failed to update algo step: algoId={update.AlgoId}, step={algoStep.Step}, status={algoStepResponse.StatusCode}, response={errorContent}");
+                    }
+                    else
+                    {
+                        await LogDebug($"Updated algo step: algoId={update.AlgoId}, step={algoStep.Step}, difficulty={normalizedStepDifficulty}");
+                    }
+                }
+
+                // Обновление StepDifficult в SolutionsByUsers
+                var solutionsByUsers = await _usersDbContext.SolutionsByUsers
+                    .Where(s => s.TestId == update.TestId)
+                    .ToListAsync();
+                foreach (var solution in solutionsByUsers)
+                {
+                    var matchingStep = algoSteps.FirstOrDefault(a => a.Step == solution.UserStep);
+                    if (matchingStep == null)
+                    {
+                        await LogWarning($"Invalid UserStep in SolutionsByUsers: testId={update.TestId}, userStep={solution.UserStep}, not found in AlgoSteps for algoId={update.AlgoId}. Available steps: {string.Join(", ", algoSteps.Select(a => a.Step))}");
+                        solution.StepDifficult = 0f;
+                    }
+                    else if (stepDifficulties.TryGetValue(solution.UserStep, out float difficulty))
+                    {
+                        solution.StepDifficult = difficulty;
+                        await LogDebug($"Updated SolutionsByUsers: testId={update.TestId}, userStep={solution.UserStep}, StepDifficult={difficulty}");
+                    }
+                    else
+                    {
+                        solution.StepDifficult = 0f;
+                        await LogWarning($"No difficulty found for UserStep={solution.UserStep} in testId={update.TestId}, setting StepDifficult=0");
+                    }
+                }
+                _usersDbContext.SolutionsByUsers.UpdateRange(solutionsByUsers);
+
+                await _usersDbContext.SaveChangesAsync();
+                await LogDebug($"Updated StepDifficult for SolutionsByUsers for testId={update.TestId}");
+
+                var sessionTests = await _usersDbContext.SessionTests
+                    .Where(st => st.TestId == update.TestId)
+                    .Select(st => st.SessionId)
+                    .Distinct()
+                    .ToListAsync();
+                foreach (var sessionId in sessionTests)
+                {
+                    if (!sessionTestIds.ContainsKey(sessionId))
+                    {
+                        sessionTestIds[sessionId] = new List<int>();
+                    }
+                    sessionTestIds[sessionId].Add(update.TestId);
+                }
+            }
+
+            // Обновление сложности сессий
+            foreach (var sessionId in sessionTestIds.Keys)
+            {
+                var testIds = sessionTestIds[sessionId];
+                float sessionDifficulty = 0f;
+                int testCount = 0;
+
+                foreach (var testId in testIds)
+                {
+                    var testResponse = await _httpClient.GetAsync($"{_testManagementUrl}/fetch-test/{testId}");
+                    if (testResponse.IsSuccessStatusCode)
+                    {
+                        var test = await testResponse.Content.ReadFromJsonAsync<Test>();
+                        if (test != null)
+                        {
+                            sessionDifficulty += test.Difficult;
+                            testCount++;
+                        }
+                    }
+                }
+
+                if (testCount > 0)
+                {
+                    sessionDifficulty /= testCount;
+                    var session = await _usersDbContext.Sessions.FirstOrDefaultAsync(s => s.SessionId == sessionId);
+                    if (session != null)
+                    {
+                        session.Difficult = Math.Min(Math.Max(sessionDifficulty, 0f), 1f);
+                        await LogDebug($"Updated session difficulty for sessionId={sessionId}: {sessionDifficulty}");
+                        _usersDbContext.Sessions.Update(session);
+                        await _usersDbContext.SaveChangesAsync();
+                    }
+                    else
+                    {
+                        await LogError($"Session not found: sessionId={sessionId}");
+                    }
                 }
             }
 
@@ -238,9 +415,13 @@ public class TestQualityController : ControllerBase
         }
         catch (Exception ex)
         {
-            await LogError($"Exception in UploadQualityParameters: {ex.Message}");
+            await LogError($"Exception in UploadQualityParameters: {ex.Message}\nStackTrace: {ex.StackTrace}");
             return StatusCode(500, $"Internal server error: {ex.Message}");
         }
+    }
+    private async Task LogWarning(string message)
+    {
+        await System.IO.File.AppendAllTextAsync(_debugLogPath, $"[{DateTime.UtcNow:MM/dd/yyyy HH:mm:ss}][TestQualityController] Warning: {message}\n");
     }
 
 
@@ -276,6 +457,7 @@ public class TestQualityController : ControllerBase
             try
             {
                 algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+                await LogDebug($"Deserialized algo steps for algoId={test.AlgoId}: {JsonSerializer.Serialize(algoSteps)}");
             }
             catch (JsonException ex)
             {
@@ -284,8 +466,7 @@ public class TestQualityController : ControllerBase
             }
 
             var stepDifficulties = algoSteps
-                .GroupBy(a => a.Step)
-                .ToDictionary(g => g.Key, g => g.OrderByDescending(a => a.AlgoId).First().Difficult);
+                .ToDictionary(a => a.Step, a => a.Difficult);
 
             var response = new
             {
@@ -427,6 +608,7 @@ public class TestQualityController : ControllerBase
             try
             {
                 algoSteps = JsonSerializer.Deserialize<List<AlgoStep>>(algoStepsContent) ?? new List<AlgoStep>();
+                await LogDebug($"Deserialized algo steps for algoId={test.AlgoId}: {JsonSerializer.Serialize(algoSteps)}");
             }
             catch (JsonException ex)
             {
@@ -435,8 +617,7 @@ public class TestQualityController : ControllerBase
             }
 
             var stepDifficulties = algoSteps
-                .GroupBy(a => a.Step)
-                .ToDictionary(g => g.Key, g => g.OrderByDescending(a => a.AlgoId).First().Difficult);
+                .ToDictionary(a => a.Step, a => a.Difficult);
 
             var response = new StatsResponseDto
             {
@@ -460,7 +641,6 @@ public class TestQualityController : ControllerBase
             return StatusCode(500, $"Internal server error: {ex.Message}");
         }
     }
-
 
     private async Task LogDebug(string message)
     {
